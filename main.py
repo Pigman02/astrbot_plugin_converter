@@ -16,8 +16,6 @@ from astrbot.api import logger
 # ===============================================
 
 # ================= 第三方库导入 =================
-# 严格依赖检查：如果 requirements.txt 未正确安装，此处将直接报错阻止插件加载
-# 这是为了避免运行时产生莫名其妙的 NameError
 try:
     import aiohttp
     from moviepy.editor import VideoFileClip, vfx
@@ -35,7 +33,7 @@ class Toolbox(Star):
         super().__init__(context)
         self.config = config
         
-        # 数据持久化路径: data/plugin_data/astrbot_plugin_converter
+        # 数据持久化路径
         self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") 
         self.temp_dir = self.base_dir / "temp"
         self.rules_file = self.base_dir / "adblock_rules.txt"
@@ -48,7 +46,7 @@ class Toolbox(Star):
         self.browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
         
-        # 线程池 (用于处理 CPU 密集型任务或同步 IO)
+        # 线程池
         self.executor = ThreadPoolExecutor(max_workers=2)
         
         # 广告规则内存缓存
@@ -58,7 +56,7 @@ class Toolbox(Star):
         asyncio.create_task(self._init_adblock_rules())
 
     # =======================================================
-    # 广告拦截核心 (强力模式 - 支持多源)
+    # 广告拦截核心
     # =======================================================
 
     async def _init_adblock_rules(self):
@@ -101,7 +99,6 @@ class Toolbox(Star):
 
         if success_count > 0:
             try:
-                # 在线程池中写入文件，避免阻塞
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     self.executor, 
@@ -116,21 +113,17 @@ class Toolbox(Star):
             logger.error("Toolbox: 所有规则源均下载失败，请检查网络或代理设置。")
 
     def _write_rules_file(self, content: str):
-        """同步写入文件方法"""
         with open(self.rules_file, "w", encoding="utf-8") as f:
             f.write(content)
 
     async def _load_rules_to_memory(self):
-        """加载规则到内存"""
         if not self.rules_file.exists(): return
         
-        # 在线程池中解析，因为文件可能很大
         loop = asyncio.get_running_loop()
         self.ad_domains = await loop.run_in_executor(self.executor, self._parse_rules_file)
         logger.info(f"Toolbox: 内存已加载 {len(self.ad_domains)} 条广告屏蔽规则")
 
     def _parse_rules_file(self) -> Set[str]:
-        """同步解析规则文件"""
         temp_set = set()
         try:
             with open(self.rules_file, "r", encoding="utf-8") as f:
@@ -156,7 +149,7 @@ class Toolbox(Star):
         })
 
         if cfg.get("enable_adblock", True):
-            # 1. 视觉层拦截 (CSS Injection)
+            # CSS 拦截
             await page.add_style_tag(content="""
                 div[class*="ad-"], div[id*="ad-"], div[class*="banner"], 
                 iframe[src*="ads"], iframe[src*="google"], 
@@ -169,7 +162,7 @@ class Toolbox(Star):
                 }
             """)
 
-            # 2. 网络层拦截 (Route Interception)
+            # 网络拦截
             block_types = {"image", "media", "font", "script", "xhr", "fetch", "websocket", "other"}
             custom_keywords = cfg.get("custom_block_list", [])
 
@@ -178,10 +171,9 @@ class Toolbox(Star):
                 if req.resource_type in block_types:
                     try:
                         hostname = urlparse(req.url).hostname
-                        # 查规则库
                         if hostname and hostname in self.ad_domains:
                             return await route.abort()
-                        # 查自定义关键词
+                        
                         url_str = req.url.lower()
                         for kw in custom_keywords:
                             if kw.replace('*', '') in url_str:
@@ -192,11 +184,10 @@ class Toolbox(Star):
             await page.route("**/*", route_handler)
 
     # =======================================================
-    # 资源管理 (Browser / Firefox)
+    # 资源管理 (Browser)
     # =======================================================
     
     async def _get_browser(self) -> Browser:
-        """获取浏览器单例"""
         async with self._browser_lock:
             if self.browser and self.browser.is_connected():
                 return self.browser
@@ -204,7 +195,6 @@ class Toolbox(Star):
             if not self.playwright:
                 self.playwright = await async_playwright().start()
             
-            # 读取代理配置
             shot_cfg = self.config.get("screenshot_config", {})
             proxy_url = shot_cfg.get("proxy_url", "")
             
@@ -220,15 +210,12 @@ class Toolbox(Star):
             return self.browser
 
     def _install_firefox_sync(self):
-        """同步安装脚本"""
         logger.info("Toolbox: 正在安装 Firefox...")
-        # 使用 sys.executable 确保环境一致
         cmd = [sys.executable, "-m", "playwright", "install", "firefox"]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         logger.info("Toolbox: Firefox 安装成功")
 
     async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        """环境检查与自动安装"""
         try:
             return await self._get_browser()
         except Exception as e:
@@ -245,7 +232,6 @@ class Toolbox(Star):
                 raise e
 
     async def terminate(self):
-        """清理资源"""
         logger.info("Toolbox: 正在清理资源...")
         if self.browser:
             try: await self.browser.close()
@@ -255,7 +241,6 @@ class Toolbox(Star):
             except: pass
         self.executor.shutdown(wait=False)
         
-        # 清理临时文件
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -264,7 +249,6 @@ class Toolbox(Star):
     # =======================================================
 
     async def _auto_scroll(self, page):
-        """自动滚动逻辑"""
         if not self.config.get("screenshot_config", {}).get("enable_auto_scroll", True):
             return
 
@@ -277,7 +261,6 @@ class Toolbox(Star):
                         var scrollHeight = document.body.scrollHeight;
                         window.scrollBy(0, distance);
                         totalHeight += distance;
-                        // 限制最大滚动高度防止死循环 (约 50000px)
                         if(totalHeight >= scrollHeight || totalHeight > 50000){
                             clearInterval(timer);
                             resolve();
@@ -353,7 +336,6 @@ class Toolbox(Star):
     async def _process_speed(self, event: AstrMessageEvent, speed_factor: float, fps: int = 15):
         target_msg = event.message_obj
         media_url = None
-        is_video = False
         
         for comp in target_msg.message:
             if isinstance(comp, Image):
@@ -361,7 +343,6 @@ class Toolbox(Star):
                 break
             elif isinstance(comp, Video):
                 media_url = comp.url
-                is_video = True
                 break
                 
         if not media_url:
@@ -372,8 +353,8 @@ class Toolbox(Star):
 
         try:
             local_path = self.temp_dir / f"src_{int(os.times().elapsed)}"
-            ext = ".mp4" if is_video else ".gif" 
-            local_path = local_path.with_suffix(ext)
+            # 默认给个后缀，moviepy会自动识别
+            local_path = local_path.with_suffix(".mp4")
             
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(media_url) as resp:
@@ -404,7 +385,7 @@ class Toolbox(Star):
             await event.send(MessageChain([Plain(f"处理失败: {e}")]))
 
     # =======================================================
-    # 指令区 (Commands) - 使用 yield
+    # 指令区 (Commands) - 修正 return yield 错误
     # =======================================================
 
     @filter.command("updatedb")
@@ -467,12 +448,15 @@ class Toolbox(Star):
             if isinstance(comp, Image):
                 img_url = comp.url
                 break
+        
+        # [修正] 拆分 yield 和 return
         if not img_url:
             yield event.plain_result("请附带图片")
             return
 
         cfg = self.config.get("ocr_config", {})
         api_key = cfg.get("api_key")
+        
         if not api_key:
             yield event.plain_result("未配置API Key")
             return
