@@ -15,7 +15,7 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.api import logger
 # ===============================================
 
-# ================= 第三方库导入 (严格检查) =================
+# ================= 第三方库导入 =================
 try:
     import aiohttp
     from moviepy.editor import VideoFileClip, vfx
@@ -25,7 +25,6 @@ try:
 except ImportError as e:
     logger.error(f"插件 astrbot_plugin_converter 依赖缺失: {e}")
     logger.error("请确保 requirements.txt 内容为: moviepy==1.0.3 pypdf Pillow playwright aiohttp")
-    logger.error("并运行: pip install -r requirements.txt")
     raise e
 # ===============================================
 
@@ -34,26 +33,20 @@ class Toolbox(Star):
         super().__init__(context)
         self.config = config
         
-        # 数据持久化路径
         self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") 
         self.temp_dir = self.base_dir / "temp"
         self.rules_file = self.base_dir / "adblock_rules.txt"
         
-        # 确保目录存在
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # 全局实例管理
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
         
-        # 线程池
         self.executor = ThreadPoolExecutor(max_workers=2)
         
-        # 广告规则内存缓存
         self.ad_domains: Set[str] = set()
         
-        # 异步初始化广告规则
         asyncio.create_task(self._init_adblock_rules())
 
     # =======================================================
@@ -61,10 +54,8 @@ class Toolbox(Star):
     # =======================================================
 
     async def _init_adblock_rules(self):
-        """初始化广告拦截规则"""
         if not self.config.get("screenshot_config", {}).get("enable_adblock", True):
             return
-
         if not self.rules_file.exists():
             logger.info("Toolbox: 本地无规则库，准备初始化...")
             await self._update_adblock_rules()
@@ -72,7 +63,6 @@ class Toolbox(Star):
             await self._load_rules_to_memory()
 
     async def _update_adblock_rules(self):
-        """批量下载 Hosts 规则并合并"""
         cfg = self.config.get("screenshot_config", {})
         urls = cfg.get("adblock_list_urls", [])
         if not urls:
@@ -101,11 +91,7 @@ class Toolbox(Star):
         if success_count > 0:
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    self.executor, 
-                    self._write_rules_file, 
-                    combined_content
-                )
+                await loop.run_in_executor(self.executor, self._write_rules_file, combined_content)
                 logger.info(f"Toolbox: 规则库更新完成，共合并 {success_count} 个源。")
                 await self._load_rules_to_memory()
             except Exception as e:
@@ -119,7 +105,6 @@ class Toolbox(Star):
 
     async def _load_rules_to_memory(self):
         if not self.rules_file.exists(): return
-        
         loop = asyncio.get_running_loop()
         self.ad_domains = await loop.run_in_executor(self.executor, self._parse_rules_file)
         logger.info(f"Toolbox: 内存已加载 {len(self.ad_domains)} 条广告屏蔽规则")
@@ -141,29 +126,17 @@ class Toolbox(Star):
         return temp_set
 
     async def _setup_page(self, page, event: AstrMessageEvent):
-        """配置页面：视口、CSS注入、网络拦截"""
         cfg = self.config.get("screenshot_config", {})
-        
-        await page.set_viewport_size({
-            "width": cfg.get("width", 1920), 
-            "height": cfg.get("height", 1080)
-        })
+        await page.set_viewport_size({"width": cfg.get("width", 1920), "height": cfg.get("height", 1080)})
 
         if cfg.get("enable_adblock", True):
-            # CSS 拦截
             await page.add_style_tag(content="""
                 div[class*="ad-"], div[id*="ad-"], div[class*="banner"], 
-                iframe[src*="ads"], iframe[src*="google"], 
-                .adsbygoogle, .g-ads, #google_ads_frame, 
-                [id^="google_ads_"], [id^="div-gpt-ad"] {
-                    display: none !important;
-                    height: 0 !important;
-                    width: 0 !important;
-                    visibility: hidden !important;
+                iframe[src*="ads"], iframe[src*="google"], .adsbygoogle, .g-ads, 
+                #google_ads_frame, [id^="google_ads_"], [id^="div-gpt-ad"] {
+                    display: none !important; height: 0 !important; width: 0 !important; visibility: hidden !important;
                 }
             """)
-
-            # 网络拦截
             block_types = {"image", "media", "font", "script", "xhr", "fetch", "websocket", "other"}
             custom_keywords = cfg.get("custom_block_list", [])
 
@@ -172,37 +145,26 @@ class Toolbox(Star):
                 if req.resource_type in block_types:
                     try:
                         hostname = urlparse(req.url).hostname
-                        if hostname and hostname in self.ad_domains:
-                            return await route.abort()
-                        
+                        if hostname and hostname in self.ad_domains: return await route.abort()
                         url_str = req.url.lower()
                         for kw in custom_keywords:
-                            if kw.replace('*', '') in url_str:
-                                return await route.abort()
+                            if kw.replace('*', '') in url_str: return await route.abort()
                     except: pass
                 await route.continue_()
-
             await page.route("**/*", route_handler)
 
     # =======================================================
-    # 资源管理 (Browser)
+    # 资源管理
     # =======================================================
     
     async def _get_browser(self) -> Browser:
         async with self._browser_lock:
-            if self.browser and self.browser.is_connected():
-                return self.browser
-            
-            if not self.playwright:
-                self.playwright = await async_playwright().start()
+            if self.browser and self.browser.is_connected(): return self.browser
+            if not self.playwright: self.playwright = await async_playwright().start()
             
             shot_cfg = self.config.get("screenshot_config", {})
             proxy_url = shot_cfg.get("proxy_url", "")
-            
-            launch_args = {
-                "headless": True,
-                "args": ["--disable-blink-features=AutomationControlled"]
-            }
+            launch_args = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
             if proxy_url:
                 logger.info(f"Toolbox: 使用代理启动浏览器 -> {proxy_url}")
                 launch_args["proxy"] = {"server": proxy_url}
@@ -217,20 +179,15 @@ class Toolbox(Star):
         logger.info("Toolbox: Firefox 安装成功")
 
     async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        try:
-            return await self._get_browser()
+        try: return await self._get_browser()
         except Exception as e:
             if "executable" in str(e).lower() or "not found" in str(e).lower():
                 logger.warning("Toolbox: Firefox内核缺失，触发自动安装")
-                if event:
-                    await event.send(MessageChain([Plain("正在初始化 Firefox 内核，请稍候...")]))
-                
+                if event: await event.send(MessageChain([Plain("正在初始化 Firefox 内核，请稍候...")]))
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(self.executor, self._install_firefox_sync)
-                
                 return await self._get_browser()
-            else:
-                raise e
+            else: raise e
 
     async def terminate(self):
         logger.info("Toolbox: 正在清理资源...")
@@ -241,31 +198,22 @@ class Toolbox(Star):
             try: await self.playwright.stop()
             except: pass
         self.executor.shutdown(wait=False)
-        
-        if self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if self.temp_dir.exists(): shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # =======================================================
-    # 核心功能逻辑
+    # 核心功能
     # =======================================================
 
     async def _auto_scroll(self, page):
-        if not self.config.get("screenshot_config", {}).get("enable_auto_scroll", True):
-            return
-
+        if not self.config.get("screenshot_config", {}).get("enable_auto_scroll", True): return
         await page.evaluate("""
             async () => {
                 await new Promise((resolve, reject) => {
-                    var totalHeight = 0;
-                    var distance = 200;
+                    var totalHeight = 0; var distance = 200;
                     var timer = setInterval(() => {
                         var scrollHeight = document.body.scrollHeight;
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
-                        if(totalHeight >= scrollHeight || totalHeight > 50000){
-                            clearInterval(timer);
-                            resolve();
-                        }
+                        window.scrollBy(0, distance); totalHeight += distance;
+                        if(totalHeight >= scrollHeight || totalHeight > 50000){ clearInterval(timer); resolve(); }
                     }, 80);
                 });
             }
@@ -280,20 +228,16 @@ class Toolbox(Star):
             await self._setup_page(page, event)
             await page.goto(url, wait_until="networkidle", timeout=60000)
             await self._auto_scroll(page)
-            
             path = self.temp_dir / f"shot_{int(os.times().elapsed)}.png"
             await page.screenshot(path=str(path), full_page=True)
             return str(path)
-        finally:
-            await page.close()
+        finally: await page.close()
 
     async def _core_web_to_pdf(self, event: AstrMessageEvent, urls: str) -> str:
         url_list = [u.strip() for u in urls.replace(',', ' ').split(' ') if u.strip()]
         if not url_list: raise ValueError("无有效URL")
-
         browser = await self._ensure_browser_env(event)
         temp_pdfs = []
-        
         try:
             for idx, raw_url in enumerate(url_list):
                 url = raw_url if raw_url.startswith("http") else "https://" + raw_url
@@ -302,50 +246,63 @@ class Toolbox(Star):
                     await self._setup_page(page, event)
                     await page.goto(url, wait_until="networkidle", timeout=90000)
                     await self._auto_scroll(page)
-                    
                     img_path = self.temp_dir / f"tmp_{idx}.png"
                     await page.screenshot(path=str(img_path), full_page=True)
-                    
                     img = PILImage.open(str(img_path))
                     if img.mode == 'RGBA': img = img.convert('RGB')
-                    
                     pdf_path = self.temp_dir / f"tmp_{idx}.pdf"
                     img.save(str(pdf_path), "PDF", resolution=100.0)
                     temp_pdfs.append(pdf_path)
                     os.remove(img_path)
-                except Exception as e:
-                    logger.error(f"Page failed: {url} - {e}")
-                finally:
-                    await page.close()
+                except Exception as e: logger.error(f"Page failed: {url} - {e}")
+                finally: await page.close()
 
             if not temp_pdfs: raise Exception("所有网页处理失败")
-
             final_path = self.temp_dir / "WebCollection.pdf"
             merger = PdfWriter()
             for pdf in temp_pdfs: merger.append(str(pdf))
             merger.write(str(final_path))
             merger.close()
-            
             for pdf in temp_pdfs:
                 try: os.remove(pdf)
                 except: pass
-                
             return str(final_path)
-        except Exception:
-            raise
+        except Exception: raise
 
+    # [核心修复] 对QQ回复消息的增强检测
     async def _process_speed(self, event: AstrMessageEvent, speed_factor: float, fps: int = 15):
-        target_msg = event.message_obj
         media_url = None
+        is_video = False
         
-        for comp in target_msg.message:
+        # 1. 优先检查当前消息链
+        for comp in event.message_obj.message:
             if isinstance(comp, Image):
-                media_url = comp.url
-                break
+                media_url = comp.url; break
             elif isinstance(comp, Video):
-                media_url = comp.url
-                break
-                
+                media_url = comp.url; is_video = True; break
+        
+        # 2. 如果没找到，检查引用回复 (OneBot 特性)
+        if not media_url:
+            try:
+                raw = event.message_obj.raw_message
+                # 检查是否存在 reply 字段
+                if isinstance(raw, dict) and 'reply' in raw:
+                    reply_data = raw['reply']
+                    # reply['message'] 通常是 segment 列表
+                    if isinstance(reply_data, dict) and 'message' in reply_data:
+                        segs = reply_data['message']
+                        if isinstance(segs, list):
+                            for seg in segs:
+                                if seg.get('type') == 'image':
+                                    media_url = seg.get('data', {}).get('url')
+                                    break
+                                elif seg.get('type') == 'video':
+                                    media_url = seg.get('data', {}).get('url')
+                                    is_video = True
+                                    break
+            except Exception as e:
+                logger.warning(f"解析回复消息失败: {e}")
+
         if not media_url:
             await event.send(MessageChain([Plain("请发送或回复一张 GIF 或视频。")]))
             return
@@ -354,8 +311,7 @@ class Toolbox(Star):
 
         try:
             local_path = self.temp_dir / f"src_{int(os.times().elapsed)}"
-            # 默认给个后缀，moviepy会自动识别
-            local_path = local_path.with_suffix(".mp4")
+            local_path = local_path.with_suffix(".mp4" if is_video else ".gif")
             
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(media_url) as resp:
@@ -386,19 +342,17 @@ class Toolbox(Star):
             await event.send(MessageChain([Plain(f"处理失败: {e}")]))
 
     # =======================================================
-    # 指令区 (Commands)
+    # 指令区
     # =======================================================
 
     @filter.command("updatedb")
     async def update_db_cmd(self, event: AstrMessageEvent):
-        '''更新广告拦截规则库'''
-        yield event.plain_result("正在下载最新广告规则(可能较慢)...")
+        yield event.plain_result("正在下载最新广告规则...")
         await self._update_adblock_rules()
-        yield event.plain_result(f"更新完成，当前生效规则: {len(self.ad_domains)} 条")
+        yield event.plain_result(f"更新完成，规则数: {len(self.ad_domains)}")
 
     @filter.command("加速")
     async def speed_up_cmd(self, event: AstrMessageEvent, factor: str = "2", fps: str = "15"):
-        '''加速: /加速 [倍数] [FPS]'''
         try:
             f = float(factor)
             target_fps = int(fps)
@@ -411,7 +365,6 @@ class Toolbox(Star):
 
     @filter.command("减速")
     async def speed_down_cmd(self, event: AstrMessageEvent, factor: str = "2", fps: str = "15"):
-        '''减速: /减速 [倍数] [FPS]'''
         try:
             f = float(factor)
             target_fps = int(fps)
@@ -424,7 +377,6 @@ class Toolbox(Star):
 
     @filter.command("web2img")
     async def web_screenshot_cmd(self, event: AstrMessageEvent, url: str):
-        '''网页截图: /web2img [url]'''
         try:
             path = await self._core_screenshot(event, url)
             yield event.image_result(str(path))
@@ -433,7 +385,6 @@ class Toolbox(Star):
 
     @filter.command("web2pdf")
     async def web_to_pdf_cmd(self, event: AstrMessageEvent, urls: str):
-        '''网页转PDF: /web2pdf [url]'''
         yield event.plain_result("正在处理...")
         try:
             path = await self._core_web_to_pdf(event, urls)
@@ -443,7 +394,6 @@ class Toolbox(Star):
 
     @filter.command("ocr")
     async def ocr_cmd(self, event: AstrMessageEvent):
-        '''识别图片: /ocr'''
         img_url = None
         for comp in event.message_obj.message:
             if isinstance(comp, Image):
@@ -456,7 +406,6 @@ class Toolbox(Star):
 
         cfg = self.config.get("ocr_config", {})
         api_key = cfg.get("api_key")
-        
         if not api_key:
             yield event.plain_result("未配置API Key")
             return
@@ -486,7 +435,6 @@ class Toolbox(Star):
 
     @filter.command("mergepdf")
     async def merge_pdf_cmd(self, event: AstrMessageEvent):
-        '''合并PDF'''
         yield event.plain_result("请发送PDF，发 'end' 结束")
         pdf_files = []
         @session_waiter(timeout=300)
@@ -532,7 +480,7 @@ class Toolbox(Star):
             controller.keep()
 
     # =======================================================
-    # LLM Tools - 使用 await event.send()
+    # LLM Tools
     # =======================================================
 
     @filter.llm_tool(name="web_screenshot")
