@@ -4,61 +4,16 @@
     "type": "object",
     "items": {
       "api_url": {
-        "description": "API 地址 (例如 https://api.openai.com/v1 或 DeepSeek/Gemini 地址)",
+        "description": "API 地址 (例如 https://api.openai.com/v1)",
         "type": "string",
         "default": "https://api.openai.com/v1"
       },
       "api_key": {
-        "description": "API Key (sk-xxxx)",
-        "type": "string",
-        "hint": "请在此填写您的 API Key"
+        "description": "API Key",
+        "type": "string"
       },
       "model_name": {
-        "description": "模型名称 (需支持 Vision, 如 gpt-4o, gemini-1.5-flash)",
-        "type": "string",
-        "default": "gpt-4o"
-      }
-    }
-  }
-}{
-  "ocr_config": {
-    "description": "OCR 视觉模型配置 (用于 /ocr 指令)",
-    "type": "object",
-    "items": {
-      "api_url": {
-        "description": "API 地址 (例如 https://api.openai.com/v1 或 DeepSeek/Gemini 地址)",
-        "type": "string",
-        "default": "https://api.openai.com/v1"
-      },
-      "api_key": {
-        "description": "API Key (sk-xxxx)",
-        "type": "string",
-        "hint": "请在此填写您的 API Key"
-      },
-      "model_name": {
-        "description": "模型名称 (需支持 Vision, 如 gpt-4o, gemini-1.5-flash)",
-        "type": "string",
-        "default": "gpt-4o"
-      }
-    }
-  }
-}{
-  "ocr_config": {
-    "description": "OCR 视觉模型配置 (用于 /ocr 指令)",
-    "type": "object",
-    "items": {
-      "api_url": {
-        "description": "API 地址 (例如 https://api.openai.com/v1 或 DeepSeek/Gemini 地址)",
-        "type": "string",
-        "default": "https://api.openai.com/v1"
-      },
-      "api_key": {
-        "description": "API Key (sk-xxxx)",
-        "type": "string",
-        "hint": "请在此填写您的 API Key"
-      },
-      "model_name": {
-        "description": "模型名称 (需支持 Vision, 如 gpt-4o, gemini-1.5-flash)",
+        "description": "模型名称 (需支持 Vision, 如 gpt-4o, deepseek-vl)",
         "type": "string",
         "default": "gpt-4o"
       }
