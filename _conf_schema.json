@@ -4,17 +4,16 @@
     "type": "object",
     "items": {
       "api_url": {
-        "description": "API 地址 (例如 https://api.openai.com/v1)",
+        "description": "API 地址",
         "type": "string",
         "default": "https://api.openai.com/v1"
       },
       "api_key": {
         "description": "API Key",
-        "type": "string",
-        "hint": "sk-xxxxxx"
+        "type": "string"
       },
       "model_name": {
-        "description": "模型名称 (需支持 Vision)",
+        "description": "模型名称",
         "type": "string",
         "default": "gpt-4o"
       }
@@ -25,37 +24,43 @@
     "type": "object",
     "items": {
       "proxy_url": {
-        "description": "HTTP代理地址 (例如 http://127.0.0.1:7890)，留空则直连",
+        "description": "HTTP代理地址 (例如 http://127.0.0.1:7890)",
         "type": "string",
         "default": ""
       },
       "width": {
-        "description": "视口宽度 (像素)",
+        "description": "视口宽度",
         "type": "int",
         "default": 1920
       },
       "height": {
-        "description": "视口高度 (像素)",
+        "description": "视口高度",
         "type": "int",
         "default": 1080
       },
       "enable_adblock": {
-        "description": "开启强力去广告 (Hosts拦截+CSS隐藏)",
+        "description": "开启强力去广告",
         "type": "bool",
         "default": true
       },
       "enable_auto_scroll": {
-        "description": "开启自动滚动 (解决图片懒加载白屏)",
+        "description": "开启自动滚动",
         "type": "bool",
         "default": true
       },
-      "adblock_list_url": {
-        "description": "广告规则订阅源 (Hosts格式)",
-        "type": "string",
-        "default": "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt"
+      "adblock_list_urls": {
+        "description": "广告规则订阅源列表 (Hosts格式，支持多个)",
+        "type": "list",
+        "default": [
+          "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt",
+          "https://raw.githubusercontent.com/privacy-protection-tools/anti-ad/master/anti-ad-domains.txt"
+        ],
+        "items": {
+          "type": "string"
+        }
       },
       "custom_block_list": {
-        "description": "自定义屏蔽关键词列表 (支持通配符*)",
+        "description": "自定义屏蔽关键词",
         "type": "list",
         "default": [
           "*googleads*",
