@@ -1,10 +1,12 @@
 import os
 import sys
+import re
 import shutil
 import asyncio
 import subprocess
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List
+from typing import Optional, List, Set
 
 # ================= 框架核心导入 =================
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -14,8 +16,7 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.api import logger
 # ===============================================
 
-# [核心修正] 硬性导入，不再使用 Any 掩盖问题
-# 如果这里报错，说明 requirements.txt 没装好，这是符合预期的
+# 硬性导入
 import aiohttp
 from moviepy.editor import VideoFileClip, vfx
 from pypdf import PdfWriter
@@ -27,19 +28,142 @@ class Toolbox(Star):
         super().__init__(context)
         self.config = config
         
-        # 数据路径
+        # 路径配置
         self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") 
         self.temp_dir = self.base_dir / "temp"
+        self.rules_file = self.base_dir / "adblock_rules.txt" # 规则缓存文件
+        
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # 全局实例
-        self.playwright: Optional[Playwright] = None
-        self.browser: Optional[Browser] = None
+        # 核心组件
+        self.playwright = None
+        self.browser = None
         self._browser_lock = asyncio.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2) 
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # 广告规则内存缓存 (Set结构，查询速度极快)
+        self.ad_domains: Set[str] = set()
+        
+        # 初始化时异步加载规则
+        asyncio.create_task(self._init_adblock_rules())
 
     # =======================================================
-    # 资源管理 (代理 / Firefox / 安装)
+    # 广告拦截核心 (强力模式)
+    # =======================================================
+
+    async def _init_adblock_rules(self):
+        """初始化广告规则：如果本地没有，则下载；如果有，则加载到内存"""
+        if not self.config.get("screenshot_config", {}).get("enable_adblock", True):
+            return
+
+        if not self.rules_file.exists():
+            logger.info("Toolbox: 本地无广告规则库，开始下载 (使用代理配置)...")
+            await self._update_adblock_rules()
+        else:
+            await self._load_rules_to_memory()
+
+    async def _update_adblock_rules(self):
+        """从 URL 下载 Hosts 格式的规则"""
+        url = self.config.get("screenshot_config", {}).get("adblock_list_url", 
+            "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt")
+        proxy = self.config.get("screenshot_config", {}).get("proxy_url", "")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, proxy=proxy if proxy else None, timeout=15) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        with open(self.rules_file, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        logger.info("Toolbox: 广告规则库更新成功")
+                        await self._load_rules_to_memory()
+                    else:
+                        logger.error(f"Toolbox: 规则下载失败 {resp.status}")
+        except Exception as e:
+            logger.error(f"Toolbox: 规则更新异常: {e}")
+
+    async def _load_rules_to_memory(self):
+        """解析 Hosts 文件到内存 Set 中"""
+        if not self.rules_file.exists(): return
+        
+        count = 0
+        temp_set = set()
+        try:
+            with open(self.rules_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        domain = parts[1]
+                        temp_set.add(domain)
+                        count += 1
+            
+            self.ad_domains = temp_set
+            logger.info(f"Toolbox: 已加载 {count} 条广告域名规则")
+        except Exception as e:
+            logger.error(f"Toolbox: 规则加载失败: {e}")
+
+    async def _setup_page(self, page, event: AstrMessageEvent):
+        """配置页面：视口、强力拦截、CSS注入"""
+        cfg = self.config.get("screenshot_config", {})
+        
+        # 1. 视口
+        await page.set_viewport_size({
+            "width": cfg.get("width", 1920), 
+            "height": cfg.get("height", 1080)
+        })
+
+        if cfg.get("enable_adblock", True):
+            # 2. 视觉层拦截 (Cosmetic Filtering)
+            # 注入 CSS 隐藏常见的广告容器，消除留白
+            await page.add_style_tag(content="""
+                div[class*="ad-"], div[id*="ad-"], div[class*="banner"], 
+                iframe[src*="ads"], iframe[src*="google"], 
+                .adsbygoogle, .g-ads, #google_ads_frame, 
+                [id^="google_ads_"], [id^="div-gpt-ad"] {
+                    display: none !important;
+                    height: 0 !important;
+                    width: 0 !important;
+                    visibility: hidden !important;
+                }
+            """)
+
+            # 3. 网络层智能拦截 (Smart Interception)
+            # 定义需要检查的资源类型 (不拦截 document/stylesheet 以免页面崩坏)
+            block_types = {"image", "media", "font", "script", "texttrack", "xhr", "fetch", "eventsource", "websocket", "other"}
+            custom_keywords = cfg.get("custom_block_list", [])
+
+            async def route_handler(route):
+                req = route.request
+                
+                # 检查资源类型
+                if req.resource_type in block_types:
+                    try:
+                        # 1. 检查域名是否在规则库中 (O(1) 极速)
+                        hostname = urlparse(req.url).hostname
+                        if hostname and hostname in self.ad_domains:
+                            # logger.debug(f"Blocked Domain: {hostname}")
+                            return await route.abort()
+                        
+                        # 2. 检查自定义关键词 (Regex/Wildcard)
+                        url_str = req.url.lower()
+                        for kw in custom_keywords:
+                            clean_kw = kw.replace('*', '')
+                            if clean_kw in url_str:
+                                return await route.abort()
+                                
+                    except Exception:
+                        pass
+                
+                # 放行
+                await route.continue_()
+
+            # 拦截所有请求并交给 handler 判断
+            await page.route("**/*", route_handler)
+
+    # =======================================================
+    # 资源管理 (Browser)
     # =======================================================
     
     async def _get_browser(self) -> Browser:
@@ -50,7 +174,7 @@ class Toolbox(Star):
             if not self.playwright:
                 self.playwright = await async_playwright().start()
             
-            # 读取代理配置
+            # 代理配置
             shot_cfg = self.config.get("screenshot_config", {})
             proxy_url = shot_cfg.get("proxy_url", "")
             
@@ -58,30 +182,25 @@ class Toolbox(Star):
                 "headless": True,
                 "args": ["--disable-blink-features=AutomationControlled"]
             }
-            
-            # 注入代理
             if proxy_url:
-                logger.info(f"Toolbox: 使用代理启动浏览器 -> {proxy_url}")
+                logger.info(f"Toolbox: 使用代理启动 -> {proxy_url}")
                 launch_args["proxy"] = {"server": proxy_url}
 
             self.browser = await self.playwright.firefox.launch(**launch_args)
             return self.browser
 
     def _install_firefox_sync(self):
-        """同步安装脚本"""
         logger.info("Toolbox: 正在安装 Firefox...")
         cmd = [sys.executable, "-m", "playwright", "install", "firefox"]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         logger.info("Toolbox: Firefox 安装成功")
 
     async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        """确保环境可用，处理内核缺失"""
         try:
             return await self._get_browser()
         except Exception as e:
-            # 仅捕获内核缺失错误
             if "executable" in str(e).lower() or "not found" in str(e).lower():
-                logger.warning("Toolbox: Firefox内核缺失，触发自动安装")
+                logger.warning("Toolbox: Firefox内核缺失")
                 if event:
                     await event.send(MessageChain([Plain("正在初始化 Firefox 内核，请稍候...")]))
                 loop = asyncio.get_running_loop()
@@ -91,7 +210,6 @@ class Toolbox(Star):
                 raise e
 
     async def terminate(self):
-        """清理资源"""
         if self.browser:
             try: await self.browser.close()
             except: pass
@@ -103,29 +221,12 @@ class Toolbox(Star):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # =======================================================
-    # 核心业务逻辑 (自动滚动 / 拦截 / 截图 / PDF)
+    # 核心功能 (自动滚动/截图/PDF)
     # =======================================================
 
-    async def _setup_page(self, page, event: AstrMessageEvent):
-        """配置视口、拦截"""
-        cfg = self.config.get("screenshot_config", {})
-        width = cfg.get("width", 1920)
-        height = cfg.get("height", 1080)
-        await page.set_viewport_size({"width": width, "height": height})
-
-        if cfg.get("enable_adblock", True):
-            patterns = [
-                "*googleads*", "*doubleclick*", "*baidu.com/pos*", "*cnzz.com*",
-                "*union.baidu*", "*adservice*", "*adsystem*", "*/ads/*"
-            ]
-            patterns.extend(cfg.get("custom_block_list", []))
-            for p in patterns:
-                await page.route(p, lambda route: route.abort())
-
     async def _auto_scroll(self, page):
-        """自动滚动到底部 (解决懒加载白屏)"""
-        cfg = self.config.get("screenshot_config", {})
-        if not cfg.get("enable_auto_scroll", True):
+        """自动滚动 (JS注入)"""
+        if not self.config.get("screenshot_config", {}).get("enable_auto_scroll", True):
             return
 
         await page.evaluate("""
@@ -137,15 +238,15 @@ class Toolbox(Star):
                         var scrollHeight = document.body.scrollHeight;
                         window.scrollBy(0, distance);
                         totalHeight += distance;
-                        if(totalHeight >= scrollHeight || totalHeight > 30000){
+                        if(totalHeight >= scrollHeight || totalHeight > 50000){ # 增加限制防止死循环
                             clearInterval(timer);
                             resolve();
                         }
-                    }, 100);
+                    }, 80); # 稍微加快滚动速度
                 });
             }
         """)
-        await page.wait_for_timeout(1000) # 等待最后的渲染
+        await page.wait_for_timeout(800)
 
     async def _core_screenshot(self, event: AstrMessageEvent, url: str) -> str:
         if not url.startswith("http"): url = "https://" + url
@@ -153,7 +254,6 @@ class Toolbox(Star):
         page = await browser.new_page()
         try:
             await self._setup_page(page, event)
-            # 增加超时时间以适应代理和滚动
             await page.goto(url, wait_until="networkidle", timeout=60000)
             await self._auto_scroll(page)
             
@@ -179,7 +279,6 @@ class Toolbox(Star):
                     await page.goto(url, wait_until="networkidle", timeout=90000)
                     await self._auto_scroll(page)
                     
-                    # 截图 -> 转 PDF
                     img_path = self.temp_dir / f"tmp_{idx}.png"
                     await page.screenshot(path=str(img_path), full_page=True)
                     
@@ -216,7 +315,6 @@ class Toolbox(Star):
     # =======================================================
     
     async def _process_speed(self, event: AstrMessageEvent, speed_factor: float, fps: int = 15):
-        # 无需检查 Any，如果没导入成功，类初始化时就会报错
         target_msg = event.message_obj
         media_url = None
         is_video = False
@@ -234,7 +332,7 @@ class Toolbox(Star):
             await event.send(MessageChain([Plain("请发送或回复一张 GIF 或视频。")]))
             return
 
-        await event.send(MessageChain([Plain(f"正在处理 (倍率 {speed_factor:.1f}x, FPS {fps})...")]))
+        await event.send(MessageChain([Plain(f"正在处理 (倍率 {speed_factor:.1f}x)...")]))
 
         try:
             local_path = self.temp_dir / f"src_{int(os.times().elapsed)}"
@@ -265,7 +363,7 @@ class Toolbox(Star):
             os.remove(out_path)
 
         except Exception as e:
-            logger.error(f"Speed Process Error: {e}")
+            logger.error(f"Speed Error: {e}")
             await event.send(MessageChain([Plain(f"处理失败: {e}")]))
 
     # =======================================================
@@ -392,8 +490,15 @@ class Toolbox(Star):
                 except: pass
             controller.keep()
 
+    @filter.command("updatedb")
+    async def update_db_cmd(self, event: AstrMessageEvent):
+        '''更新广告拦截数据库'''
+        yield event.plain_result("正在下载最新广告规则(需代理)...")
+        await self._update_adblock_rules()
+        yield event.plain_result(f"更新完成，当前加载规则数: {len(self.ad_domains)}")
+
     # =======================================================
-    # LLM 工具
+    # LLM Tools
     # =======================================================
 
     @filter.llm_tool(name="web_screenshot")
