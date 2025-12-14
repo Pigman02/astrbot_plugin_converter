@@ -5,14 +5,15 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-# ================= 框架核心导入 =================
+# ================= 框架核心导入 (已修复导入路径) =================
 from astrbot.api.event import filter, AstrMessageEvent
+# [修复 1] MessageChain 从 astrbot.api.event 导入，而不是 message_components
+from astrbot.api.event import MessageChain 
 from astrbot.api.star import Context, Star, StarTools
-# 引入 MessageChain 用于主动发送消息
-from astrbot.api.message_components import Image, Plain, File, MessageChain
+from astrbot.api.message_components import Image, Plain, File
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.api import logger
-# ===============================================
+# ================================================================
 
 # 第三方库导入
 try:
@@ -29,8 +30,8 @@ class Toolbox(Star):
         super().__init__(context)
         self.config = config
         
-        # 数据持久化路径
-        self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") # 修正插件名匹配你的文件夹
+        # 数据持久化
+        self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter")
         self.temp_dir = self.base_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
@@ -39,7 +40,6 @@ class Toolbox(Star):
         self.browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
         
-        # 线程池
         self.executor = ThreadPoolExecutor(max_workers=1)
 
     # =======================================================
@@ -47,7 +47,6 @@ class Toolbox(Star):
     # =======================================================
     
     async def _get_browser_instance_only(self) -> Browser:
-        """内部方法：仅尝试获取浏览器"""
         async with self._browser_lock:
             if self.browser and self.browser.is_connected():
                 return self.browser
@@ -57,7 +56,6 @@ class Toolbox(Star):
             return self.browser
 
     def _install_firefox_sync(self):
-        """同步安装脚本"""
         import subprocess
         logger.info("Toolbox: 开始下载 Firefox 内核...")
         try:
@@ -69,16 +67,13 @@ class Toolbox(Star):
             raise Exception(f"安装失败: {e.stderr}")
 
     async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        """
-        确保浏览器可用。如果未安装，会自动安装并使用 event.send 通知用户。
-        注意：此函数不再 yield，而是直接 send。
-        """
+        """确保浏览器可用，不可用则安装。使用 event.send 代替 yield"""
         try:
             return await self._get_browser_instance_only()
         except Exception:
-            # 捕获异常，说明需要安装
             logger.warning("Toolbox: Firefox 未安装，触发自动安装流程。")
             if event:
+                # [修复 2] 使用 MessageChain 构造消息并使用 send 发送
                 await event.send(MessageChain([Plain("检测到 Firefox 未安装，正在后台下载内核 (约1-2分钟)...")]))
             
             loop = asyncio.get_running_loop()
@@ -90,7 +85,6 @@ class Toolbox(Star):
             return await self._get_browser_instance_only()
 
     async def terminate(self):
-        """资源清理"""
         if self.browser:
             try: await self.browser.close()
             except: pass
@@ -105,13 +99,13 @@ class Toolbox(Star):
             except: pass
 
     # =======================================================
-    # 功能实现 (修复 SyntaxError)
+    # 功能实现 (工具方法中不再使用 yield，解决 SyntaxError)
     # =======================================================
 
     @filter.command("ocr")
     async def ocr_cmd(self, event: AstrMessageEvent):
         '''识别图片文字: /ocr (需附带图片)'''
-        # 指令函数可以使用 yield，因为它不需要返回值给 LLM
+        # 指令(Command)可以使用 yield，因为它不需要向 LLM 返回值
         img_url = None
         for component in event.message_obj.message:
             if isinstance(component, Image):
@@ -151,7 +145,8 @@ class Toolbox(Star):
                         yield event.plain_result(f"API请求失败: {resp.status}")
                         return
                     data = await resp.json()
-                    yield event.plain_result(data["choices"][0]["message"]["content"])
+                    content = data["choices"][0]["message"]["content"]
+                    yield event.plain_result(content)
         except Exception as e:
             logger.error(f"OCR Error: {e}")
             yield event.plain_result(f"OCR Error: {e}")
@@ -162,23 +157,22 @@ class Toolbox(Star):
         if not url.startswith("http"): url = "https://" + url
         
         try:
-            # 1. 获取浏览器 (内部会自动 send 消息通知进度，不再 yield)
+            # 1. 获取浏览器
             browser = await self._ensure_browser_env(event)
 
-            # 2. 执行截图
+            # 2. 截图
             page = await browser.new_page()
             try:
                 await page.set_viewport_size({"width": 1920, "height": 1080})
                 await page.goto(url, wait_until="networkidle", timeout=30000)
                 
-                # 构建文件路径
                 path = self.temp_dir / f"shot_{int(os.times().elapsed)}.png"
                 await page.screenshot(path=str(path), full_page=True)
                 
-                # [修复点] 使用 await event.send 代替 yield
+                # [修复 2] 使用 event.send 发送图片，不使用 yield
                 await event.send(MessageChain([Image.fromFileSystem(str(path))]))
                 
-                # [修复点] 现在可以安全地 return 了
+                # [修复 3] 返回字符串给 LLM
                 return "截图已发送给用户。"
             finally:
                 await page.close()
@@ -194,7 +188,7 @@ class Toolbox(Star):
         if not url_list: return "无有效URL"
         if len(url_list) > 5: return "一次最多支持5个网页"
 
-        # [修复点] 主动发送提示消息
+        # 使用 send 而不是 yield
         await event.send(MessageChain([Plain(f"正在处理 {len(url_list)} 个网页 (Firefox引擎)...")]))
         
         try:
@@ -238,7 +232,7 @@ class Toolbox(Star):
             merger.write(str(final_path))
             merger.close()
 
-            # [修复点] 发送文件
+            # 发送文件
             await event.send(MessageChain([File(file=str(final_path), name="网页合集.pdf")]))
             
             for f in temp_imgs + temp_pdfs:
@@ -281,7 +275,6 @@ class Toolbox(Star):
                 controller.stop()
                 return
 
-            # 文件接收逻辑
             file_url = None
             file_name = f"upload_{len(pdf_files)}.pdf"
             for comp in ctx.message_obj.message:
@@ -335,7 +328,7 @@ class Toolbox(Star):
             out = self.temp_dir / f"cvt.{target}"
             img.save(str(out))
             
-            # [修复点] 使用 await event.send
+            # 使用 send 代替 yield
             await event.send(MessageChain([Image.fromFileSystem(str(out))]))
             return f"已转换为 {target}"
         except Exception as e:
