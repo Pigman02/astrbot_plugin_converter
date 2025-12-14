@@ -1,10 +1,10 @@
 {
   "ocr_config": {
-    "description": "OCR 视觉模型配置 (用于 /ocr 指令)",
+    "description": "OCR 视觉模型配置",
     "type": "object",
     "items": {
       "api_url": {
-        "description": "API 地址 (例如 https://api.openai.com/v1)",
+        "description": "API 地址",
         "type": "string",
         "default": "https://api.openai.com/v1"
       },
@@ -13,9 +13,38 @@
         "type": "string"
       },
       "model_name": {
-        "description": "模型名称 (需支持 Vision, 如 gpt-4o, deepseek-vl)",
+        "description": "模型名称",
         "type": "string",
         "default": "gpt-4o"
+      }
+    }
+  },
+  "screenshot_config": {
+    "description": "网页截图与广告拦截设置",
+    "type": "object",
+    "items": {
+      "width": {
+        "description": "浏览器视口宽度 (像素)",
+        "type": "int",
+        "default": 1920
+      },
+      "height": {
+        "description": "浏览器视口高度 (像素)",
+        "type": "int",
+        "default": 1080
+      },
+      "enable_adblock": {
+        "description": "开启内置广告拦截 (拦截常见广告域名)",
+        "type": "bool",
+        "default": true
+      },
+      "custom_block_list": {
+        "description": "自定义屏蔽列表 (支持通配符 * )",
+        "type": "list",
+        "default": ["*googleads*", "*doubleclick*", "*cnzz*", "*baidu.com/pos*"],
+        "items": {
+            "type": "string"
+        }
       }
     }
   }
