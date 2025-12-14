@@ -3,50 +3,64 @@ import sys
 import shutil
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, List, Union
 
-# ================= 框架核心导入 (已修复导入路径) =================
+# ================= 框架核心导入 =================
 from astrbot.api.event import filter, AstrMessageEvent
-# [修复 1] MessageChain 从 astrbot.api.event 导入，而不是 message_components
-from astrbot.api.event import MessageChain 
 from astrbot.api.star import Context, Star, StarTools
+# [优化] 只导入基础组件，移除不稳定的 MessageChain 导入
 from astrbot.api.message_components import Image, Plain, File
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.api import logger
-# ================================================================
+# ===============================================
 
-# 第三方库导入
+# [修复] 定义类型占位符，防止 ImportError 导致 NameError
+Browser = None
+Playwright = None
+
+# 第三方库导入 (带错误处理)
 try:
     import aiohttp
     from moviepy.editor import VideoFileClip
     from pypdf import PdfWriter
     from PIL import Image as PILImage
+    # Playwright 异步 API
     from playwright.async_api import async_playwright, Playwright, Browser
 except ImportError as e:
-    logger.warning(f"Toolbox: 依赖库未完整安装: {e}")
+    # 即使报错也不要抛出，否则整个插件类都无法加载
+    logger.warning(f"Toolbox: 部分依赖库未安装，将在运行时尝试修复或报错: {e}")
 
 class Toolbox(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 数据持久化
-        self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter")
+        # 数据持久化路径 (Path对象)
+        # 请确保这里的插件名字符串与你的文件夹名称一致
+        self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") 
         self.temp_dir = self.base_dir / "temp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
         # Playwright 全局实例
-        self.playwright: Optional[Playwright] = None
-        self.browser: Optional[Browser] = None
+        # [修复] 使用 "Playwright" 字符串类型提示，避免未定义错误
+        self.playwright: Optional["Playwright"] = None
+        self.browser: Optional["Browser"] = None
         self._browser_lock = asyncio.Lock()
         
+        # 线程池 (用于后台安装)
         self.executor = ThreadPoolExecutor(max_workers=1)
 
     # =======================================================
     # 资源管理
     # =======================================================
     
-    async def _get_browser_instance_only(self) -> Browser:
+    # [修复] 使用字符串 "Browser" 作为返回值类型提示，解决 NameError
+    async def _get_browser_instance_only(self) -> "Browser":
+        """内部方法：仅尝试获取浏览器"""
+        # 再次检查 Playwright 是否导入成功
+        if 'async_playwright' not in globals():
+             raise ImportError("playwright 库未安装，无法启动浏览器")
+
         async with self._browser_lock:
             if self.browser and self.browser.is_connected():
                 return self.browser
@@ -56,35 +70,47 @@ class Toolbox(Star):
             return self.browser
 
     def _install_firefox_sync(self):
+        """同步安装脚本"""
         import subprocess
         logger.info("Toolbox: 开始下载 Firefox 内核...")
         try:
+            # 强制使用当前环境的 pip/python
             cmd = [sys.executable, "-m", "playwright", "install", "firefox"]
             subprocess.run(cmd, capture_output=True, text=True, check=True)
             logger.info("Toolbox: Firefox 安装成功")
         except subprocess.CalledProcessError as e:
             logger.error(f"Toolbox: Firefox 安装失败 stderr: {e.stderr}")
             raise Exception(f"安装失败: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Toolbox: 安装命令执行异常: {e}")
+            raise e
 
-    async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        """确保浏览器可用，不可用则安装。使用 event.send 代替 yield"""
+    async def _ensure_browser_env(self, event: AstrMessageEvent) -> "Browser":
+        """确保浏览器可用。如果未安装，会自动安装并通知用户。"""
         try:
             return await self._get_browser_instance_only()
-        except Exception:
-            logger.warning("Toolbox: Firefox 未安装，触发自动安装流程。")
-            if event:
-                # [修复 2] 使用 MessageChain 构造消息并使用 send 发送
-                await event.send(MessageChain([Plain("检测到 Firefox 未安装，正在后台下载内核 (约1-2分钟)...")]))
-            
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, self._install_firefox_sync)
-            
-            if event:
-                await event.send(MessageChain([Plain("安装完成，正在执行任务...")]))
-            
-            return await self._get_browser_instance_only()
+        except Exception as e:
+            # 捕获异常，判断是否为缺少内核
+            err_msg = str(e).lower()
+            if "executable doesn't exist" in err_msg or "not found" in err_msg or "playwright" in err_msg:
+                logger.warning("Toolbox: Firefox 未安装，触发自动安装流程。")
+                if event:
+                    # [修复] 直接传入列表，不依赖 MessageChain 类
+                    await event.send([Plain("检测到 Firefox 未安装，正在后台下载内核 (约1-2分钟)...")])
+                
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self.executor, self._install_firefox_sync)
+                
+                if event:
+                    await event.send([Plain("安装完成，正在执行任务...")])
+                
+                return await self._get_browser_instance_only()
+            else:
+                # 其他错误直接抛出
+                raise e
 
     async def terminate(self):
+        """资源清理"""
         if self.browser:
             try: await self.browser.close()
             except: pass
@@ -99,13 +125,12 @@ class Toolbox(Star):
             except: pass
 
     # =======================================================
-    # 功能实现 (工具方法中不再使用 yield，解决 SyntaxError)
+    # 功能实现
     # =======================================================
 
     @filter.command("ocr")
     async def ocr_cmd(self, event: AstrMessageEvent):
         '''识别图片文字: /ocr (需附带图片)'''
-        # 指令(Command)可以使用 yield，因为它不需要向 LLM 返回值
         img_url = None
         for component in event.message_obj.message:
             if isinstance(component, Image):
@@ -166,13 +191,12 @@ class Toolbox(Star):
                 await page.set_viewport_size({"width": 1920, "height": 1080})
                 await page.goto(url, wait_until="networkidle", timeout=30000)
                 
+                # 转为字符串路径，保证兼容性
                 path = self.temp_dir / f"shot_{int(os.times().elapsed)}.png"
                 await page.screenshot(path=str(path), full_page=True)
                 
-                # [修复 2] 使用 event.send 发送图片，不使用 yield
-                await event.send(MessageChain([Image.fromFileSystem(str(path))]))
-                
-                # [修复 3] 返回字符串给 LLM
+                # 发送图片 (传入列表)
+                await event.send([Image.fromFileSystem(str(path))])
                 return "截图已发送给用户。"
             finally:
                 await page.close()
@@ -188,8 +212,7 @@ class Toolbox(Star):
         if not url_list: return "无有效URL"
         if len(url_list) > 5: return "一次最多支持5个网页"
 
-        # 使用 send 而不是 yield
-        await event.send(MessageChain([Plain(f"正在处理 {len(url_list)} 个网页 (Firefox引擎)...")]))
+        await event.send([Plain(f"正在处理 {len(url_list)} 个网页 (Firefox引擎)...")])
         
         try:
             browser = await self._ensure_browser_env(event)
@@ -219,7 +242,7 @@ class Toolbox(Star):
                     temp_pdfs.append(pdf_path)
                 except Exception as e:
                     logger.error(f"Page {url} failed: {e}")
-                    await event.send(MessageChain([Plain(f"警告: {url} 处理失败，已跳过")]))
+                    await event.send([Plain(f"警告: {url} 处理失败，已跳过")])
                 finally:
                     await page.close()
 
@@ -233,7 +256,7 @@ class Toolbox(Star):
             merger.close()
 
             # 发送文件
-            await event.send(MessageChain([File(file=str(final_path), name="网页合集.pdf")]))
+            await event.send([File(file=str(final_path), name="网页合集.pdf")])
             
             for f in temp_imgs + temp_pdfs:
                 try: os.remove(f)
@@ -265,7 +288,7 @@ class Toolbox(Star):
                         for f in pdf_files: merger.append(str(f))
                         merger.write(str(out_path))
                         merger.close()
-                        await ctx.send(ctx.chain_result([File(file=str(out_path), name="合并文件.pdf")]))
+                        await ctx.send([File(file=str(out_path), name="合并文件.pdf")])
                     except Exception as e:
                         await ctx.send(ctx.plain_result(f"合并失败: {e}"))
                     finally:
@@ -328,8 +351,7 @@ class Toolbox(Star):
             out = self.temp_dir / f"cvt.{target}"
             img.save(str(out))
             
-            # 使用 send 代替 yield
-            await event.send(MessageChain([Image.fromFileSystem(str(out))]))
+            await event.send([Image.fromFileSystem(str(out))])
             return f"已转换为 {target}"
         except Exception as e:
             return f"转换错误: {e}"
