@@ -1,0 +1,5 @@
+moviepy
+pypdf
+Pillow
+playwright
+aiohttp
