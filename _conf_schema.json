@@ -3,30 +3,69 @@
     "description": "OCR 视觉模型配置",
     "type": "object",
     "items": {
-      "api_url": { "description": "API 地址", "type": "string", "default": "https://api.openai.com/v1" },
-      "api_key": { "description": "API Key", "type": "string" },
-      "model_name": { "description": "模型名称", "type": "string", "default": "gpt-4o" }
+      "api_url": {
+        "description": "API 地址 (例如 https://api.openai.com/v1)",
+        "type": "string",
+        "default": "https://api.openai.com/v1"
+      },
+      "api_key": {
+        "description": "API Key",
+        "type": "string",
+        "hint": "sk-xxxxxx"
+      },
+      "model_name": {
+        "description": "模型名称 (需支持 Vision)",
+        "type": "string",
+        "default": "gpt-4o"
+      }
     }
   },
   "screenshot_config": {
-    "description": "网页截图/代理/加载设置",
+    "description": "网页截图/代理/去广告设置",
     "type": "object",
     "items": {
-      "proxy_url": { "description": "HTTP代理地址", "type": "string", "default": "" },
-      "width": { "description": "视口宽度", "type": "int", "default": 1920 },
-      "height": { "description": "视口高度", "type": "int", "default": 1080 },
-      "enable_adblock": { "description": "开启强力去广告", "type": "bool", "default": true },
-      "adblock_list_url": { 
-        "description": "广告规则订阅源(Hosts格式)", 
-        "type": "string", 
-        "default": "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt" 
+      "proxy_url": {
+        "description": "HTTP代理地址 (例如 http://127.0.0.1:7890)，留空则直连",
+        "type": "string",
+        "default": ""
       },
-      "enable_auto_scroll": { "description": "开启自动滚动", "type": "bool", "default": true },
+      "width": {
+        "description": "视口宽度 (像素)",
+        "type": "int",
+        "default": 1920
+      },
+      "height": {
+        "description": "视口高度 (像素)",
+        "type": "int",
+        "default": 1080
+      },
+      "enable_adblock": {
+        "description": "开启强力去广告 (Hosts拦截+CSS隐藏)",
+        "type": "bool",
+        "default": true
+      },
+      "enable_auto_scroll": {
+        "description": "开启自动滚动 (解决图片懒加载白屏)",
+        "type": "bool",
+        "default": true
+      },
+      "adblock_list_url": {
+        "description": "广告规则订阅源 (Hosts格式)",
+        "type": "string",
+        "default": "https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt"
+      },
       "custom_block_list": {
-        "description": "自定义屏蔽关键词",
+        "description": "自定义屏蔽关键词列表 (支持通配符*)",
         "type": "list",
-        "default": ["*googleads*", "*doubleclick*", "*cnzz*", "*baidu.com/pos*"],
-        "items": { "type": "string" }
+        "default": [
+          "*googleads*",
+          "*doubleclick*",
+          "*cnzz*",
+          "*baidu.com/pos*"
+        ],
+        "items": {
+          "type": "string"
+        }
       }
     }
   }
