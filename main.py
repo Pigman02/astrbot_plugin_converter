@@ -15,7 +15,7 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.api import logger
 # ===============================================
 
-# ================= 第三方库导入 =================
+# ================= 第三方库导入 (严格检查) =================
 try:
     import aiohttp
     from moviepy.editor import VideoFileClip, vfx
@@ -24,7 +24,8 @@ try:
     from playwright.async_api import async_playwright, Playwright, Browser
 except ImportError as e:
     logger.error(f"插件 astrbot_plugin_converter 依赖缺失: {e}")
-    logger.error("请检查 requirements.txt 并运行: pip install -r requirements.txt")
+    logger.error("请确保 requirements.txt 内容为: moviepy==1.0.3 pypdf Pillow playwright aiohttp")
+    logger.error("并运行: pip install -r requirements.txt")
     raise e
 # ===============================================
 
@@ -385,7 +386,7 @@ class Toolbox(Star):
             await event.send(MessageChain([Plain(f"处理失败: {e}")]))
 
     # =======================================================
-    # 指令区 (Commands) - 修正 return yield 错误
+    # 指令区 (Commands)
     # =======================================================
 
     @filter.command("updatedb")
@@ -449,7 +450,6 @@ class Toolbox(Star):
                 img_url = comp.url
                 break
         
-        # [修正] 拆分 yield 和 return
         if not img_url:
             yield event.plain_result("请附带图片")
             return
