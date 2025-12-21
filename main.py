@@ -29,34 +29,45 @@ except ImportError as e:
     logger.error(f"插件依赖缺失: {e}")
     logger.error("请确保安装: pip install imageio[ffmpeg] pypdf Pillow playwright aiohttp")
 
-@register("toolbox", "YourName", "全能工具箱(截图/PDF/OCR/GIF)", "1.3.0")
+@register("toolbox", "YourName", "全能工具箱(截图/PDF/OCR/GIF)", "1.3.2")
 class Toolbox(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 目录配置
+        # 基础目录配置
         self.base_dir = StarTools.get_data_dir("astrbot_plugin_toolbox") 
         self.temp_dir = self.base_dir / "temp"
         self.rules_file = self.base_dir / "adblock_rules.txt"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # 资源管理
+        # 资源锁与线程池
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
         self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # 广告拦截
+        # 广告拦截初始化
         self.ad_domains: Set[str] = set()
         asyncio.create_task(self._init_adblock_rules())
 
+    async def terminate(self):
+        """插件卸载时清理资源"""
+        if self.browser:
+            try: await self.browser.close()
+            except: pass
+        if self.playwright:
+            try: await self.playwright.stop()
+            except: pass
+        self.executor.shutdown(wait=False)
+        try: shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except: pass
+
     # =======================================================
-    # 1. 核心工具函数 (媒体提取/文件保存)
+    # 1. 核心工具函数 (无需修改)
     # =======================================================
 
     def _save_animation(self, output: io.BytesIO, frames: list, duration_ms: int, loop: int = 0):
-        """统一保存动画，支持 GIF/APNG/WEBP"""
         fmt = self.config.get('output_format', 'GIF').upper()
         try:
             if fmt == 'APNG':
@@ -66,16 +77,16 @@ class Toolbox(Star):
                 frames[0].save(output, format='WEBP', save_all=True, append_images=frames[1:], 
                              duration=duration_ms, loop=loop, method=3, quality=80)
             else:
-                # GIF 默认配置
                 frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
                              duration=duration_ms, loop=loop, optimize=True, disposal=2)
         except Exception as e:
-            logger.error(f"Save animation failed, fallback to GIF. Error: {e}")
+            logger.error(f"Save animation error: {e}")
+            # 失败回退到 GIF
             frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
                          duration=duration_ms, loop=loop, optimize=True, disposal=2)
 
     async def _resolve_file_via_api(self, event: AstrMessageEvent, file_id: str) -> str:
-        """调用 Bot API 解析 file_id"""
+        """调用 Bot API 解析文件 ID 获取真实链接"""
         try:
             res = await event.bot.api.call_action("get_file", file_id=file_id)
             if not res or not isinstance(res, dict): return None
@@ -88,52 +99,52 @@ class Toolbox(Star):
         except: return None
 
     def _get_media_source(self, event: AstrMessageEvent, media_type: str = 'video') -> Optional[str]:
-        """强大的媒体提取器，支持引用回复、原始数据包解析"""
-        candidates = [] # (score, url/path)
+        """从消息中提取图片或视频链接 (支持引用、转发、原始数据)"""
+        candidates = []
         
         def extract(item):
-            # 1. URL
+            # 1. URL 检查
             url = getattr(item, 'url', None)
-            if not url and isinstance(item, dict):
+            if not url and isinstance(item, dict): 
                 url = item.get('data', {}).get('url') or item.get('url')
-            if url and isinstance(url, str) and url.startswith('http'):
+            if url and isinstance(url, str) and url.startswith('http'): 
                 return 100, url
-            # 2. Path
+            
+            # 2. 本地路径检查
             path = getattr(item, 'path', None)
-            if not path and isinstance(item, dict):
+            if not path and isinstance(item, dict): 
                 path = item.get('data', {}).get('path') or item.get('path')
-            if path and isinstance(path, str) and os.path.isabs(path) and os.path.exists(path):
+            if path and isinstance(path, str) and os.path.isabs(path) and os.path.exists(path): 
                 return 90, path
-            # 3. File ID
+            
+            # 3. File ID 检查
             fid = getattr(item, 'file', None)
-            if not fid and isinstance(item, dict):
+            if not fid and isinstance(item, dict): 
                 fid = item.get('data', {}).get('file') or item.get('file')
-            if fid and isinstance(fid, str):
+            if fid and isinstance(fid, str): 
                 return 50, fid
             return 0, None
 
         items = []
-        # 检查 AstrBot 封装的方法
+        # 检查 AstrBot 封装对象
         if media_type == 'video' and hasattr(event, "get_videos"): items.extend(event.get_videos() or [])
         if media_type == 'image' and hasattr(event, "get_images"): items.extend(event.get_images() or [])
         
-        # 检查原始数据 (OneBot 协议)
+        # 检查原始 OneBot 数据
         raw = getattr(event, 'raw_message', None) or getattr(event, 'raw_data', {})
         if isinstance(raw, dict) and 'reply' in raw:
             reply_pl = raw['reply']
             msgs = reply_pl.get('message') or reply_pl.get('content')
             if isinstance(msgs, list): items.extend(msgs)
 
-        # 检查当前消息链
+        # 检查消息链
         if hasattr(event.message_obj, "message"):
             for seg in event.message_obj.message:
-                if isinstance(seg, (Image, Video, dict)):
-                    # 简单类型过滤
-                    if isinstance(seg, dict):
-                        if seg.get('type') == media_type: items.append(seg)
-                    elif (media_type == 'image' and isinstance(seg, Image)) or \
-                         (media_type == 'video' and isinstance(seg, Video)):
-                        items.append(seg)
+                if isinstance(seg, dict) and seg.get('type') == media_type: 
+                    items.append(seg)
+                elif (media_type == 'image' and isinstance(seg, Image)) or \
+                     (media_type == 'video' and isinstance(seg, Video)): 
+                    items.append(seg)
 
         for item in items:
             s, v = extract(item)
@@ -143,49 +154,38 @@ class Toolbox(Star):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    async def terminate(self):
-        """资源清理"""
-        logger.info("Toolbox: 清理资源...")
-        if self.browser:
-            try: await self.browser.close()
-            except: pass
-        if self.playwright:
-            try: await self.playwright.stop()
-            except: pass
-        self.executor.shutdown(wait=False)
-        try: shutil.rmtree(self.temp_dir, ignore_errors=True)
-        except: pass
-
     # =======================================================
-    # 2. 视频转GIF / 变速 / 压缩 (ImageIO实现)
+    # 2. 视频转GIF / 变速 / 压缩 (ImageIO 实现)
     # =======================================================
 
     def _parse_video_args(self, text: str):
-        """参数解析: 0s-5s, fps=15, 0.5x, scale=0.8"""
         params = {
-            'start': 0.0, 'end': None,
-            'fps': self.config.get('default_fps', 12),
+            'start': 0.0, 'end': None, 
+            'fps': self.config.get('default_fps', 12), 
             'scale': self.config.get('default_scale', 0.5), 
-            'speed': 1.0 
+            'speed': 1.0
         }
-        # 时间
+        # 解析时间: 0s-5s
         time_range = re.search(r'(\d+(?:\.\d+)?)[sS]?\s*[-~]\s*(\d+(?:\.\d+)?)[sS]?', text)
         if time_range:
             params['start'] = float(time_range.group(1))
             params['end'] = float(time_range.group(2))
-        # 帧率
+        
+        # 解析帧率: fps=15
         fps_match = re.search(r'(?:fps|帧率)[ :=]?(\d+)', text, re.IGNORECASE)
         if fps_match: params['fps'] = int(fps_match.group(1))
-        # 缩放
+        
+        # 解析缩放: scale=0.8
         scale_match = re.search(r'(?:scale|缩放|大小)[ :=]?(0\.\d+|1\.0)', text)
         if scale_match: params['scale'] = float(scale_match.group(1))
-        # 速度
+        
+        # 解析速度: 2x
         speed_match = re.search(r'(\d+(?:\.\d+)?)[xX]?(?:倍速|倍|speed)', text)
         if speed_match: params['speed'] = float(speed_match.group(1))
+        
         return params
 
     def _process_video_core(self, video_path: str, params: dict, max_colors: int = 256):
-        """转换核心逻辑"""
         try:
             reader = imageio.get_reader(video_path, format='FFMPEG')
             meta = reader.get_meta_data()
@@ -195,11 +195,11 @@ class Toolbox(Star):
             start_t = params['start']
             end_t = params['end'] if params['end'] else duration
             
-            # 限制时长防止内存溢出
+            # 限制时长，防止内存爆炸
             max_dur = self.config.get('max_gif_duration', 15.0)
             if (end_t - start_t) > max_dur: end_t = start_t + max_dur
 
-            # 计算采样步长
+            # 抽帧步长计算
             target_fps = params['fps']
             base_step = max(1, src_fps / target_fps)
             final_step = max(1, int(base_step * params['speed']))
@@ -218,12 +218,12 @@ class Toolbox(Star):
                     if params['scale'] != 1.0:
                         w, h = pil_img.size
                         pil_img = pil_img.resize((int(w*params['scale']), int(h*params['scale'])), PILImage.Resampling.BILINEAR)
-                    # 量化
+                    # 颜色量化
                     if output_fmt == 'GIF' and max_colors < 256:
                         pil_img = pil_img.quantize(colors=max_colors, method=1)
                     frames.append(pil_img)
                 
-                if len(frames) > 500: break # 安全熔断
+                if len(frames) > 500: break # 熔断
 
             reader.close()
             if not frames: return None, "无有效帧", 0
@@ -238,14 +238,14 @@ class Toolbox(Star):
             return None, str(e), 0
 
     def _worker_video_wrapper(self, video_path: str, params: dict):
-        """工作线程：包含智能压缩重试逻辑"""
+        """视频处理工作线程：包含智能压缩"""
         max_colors = self.config.get('gif_max_colors', 256)
         
         # 第一次尝试
         gif_io, msg, size_mb = self._process_video_core(video_path, params, max_colors)
         if not gif_io: return msg, None
         
-        # 智能压缩: 如果是 GIF 且 > 10MB
+        # 如果体积过大且是GIF，尝试降低画质重试
         if size_mb > 10.0 and self.config.get('output_format', 'GIF').upper() == 'GIF':
             new_params = params.copy()
             new_params['scale'] = round(params['scale'] * 0.7, 2)
@@ -258,13 +258,14 @@ class Toolbox(Star):
         return f"✅ 转换成功 {msg} ({size_mb:.2f}MB)", gif_io
 
     def _process_gif_speed(self, img_data: bytes, factor: float):
-        """GIF变速处理"""
+        """处理 GIF 变速"""
         try:
             img = PILImage.open(io.BytesIO(img_data))
             if not getattr(img, "is_animated", False): return "这不是动图", None
             
             frames, durs = [], []
             for frame in ImageSequence.Iterator(img):
+                # 加速 = 持续时间变短
                 new_dur = max(20, int(frame.info.get('duration', 100) / factor))
                 durs.append(new_dur)
                 frames.append(frame.copy())
@@ -274,11 +275,11 @@ class Toolbox(Star):
                          duration=durs, loop=0, disposal=2, optimize=True)
             output.seek(0)
             return "✅ 变速完成", output
-        except Exception as e: return f"异常: {e}", None
+        except Exception as e: return f"处理异常: {e}", None
 
     @filter.command("视频转gif")
     async def video_to_gif_cmd(self, event: AstrMessageEvent):
-        """视频转GIF: /视频转gif 0s-5s fps=15"""
+        """用法: /视频转gif 0s-5s fps=15"""
         params = self._parse_video_args(event.message_str.replace("视频转gif", ""))
         
         # 1. 获取源
@@ -287,13 +288,13 @@ class Toolbox(Star):
             yield event.plain_result("❌ 请回复视频或发送链接")
             return
             
-        # 2. 解析
+        # 2. 解析链接
         valid_src = raw_src
         if not (raw_src.startswith("http") or os.path.exists(raw_src)):
             yield event.plain_result("⏳ 解析视频地址...")
             valid_src = await self._resolve_file_via_api(event, raw_src)
             if not valid_src:
-                yield event.plain_result("❌ 无法获取视频")
+                yield event.plain_result("❌ 无法获取视频地址")
                 return
 
         yield event.plain_result(f"⏳ 处理中... (缩放:{params['scale']} FPS:{params['fps']})")
@@ -315,8 +316,11 @@ class Toolbox(Star):
             else:
                 tmp_path = valid_src
             
+            # 提交到线程池
             loop = asyncio.get_running_loop()
-            msg, gif_bytes = await loop.run_in_executor(self.executor, self._worker_video_wrapper, tmp_path, params)
+            msg, gif_bytes = await loop.run_in_executor(
+                self.executor, self._worker_video_wrapper, tmp_path, params
+            )
             
             if gif_bytes:
                 yield event.chain_result([Plain(msg), Image.fromBytes(gif_bytes.getvalue())])
@@ -329,43 +333,71 @@ class Toolbox(Star):
                 try: os.remove(tmp_path)
                 except: pass
 
+    # ================= 修复的核心部分 =================
     @filter.command("加速")
     async def speed_up(self, event: AstrMessageEvent, factor: str = "2"):
-        await self._handle_speed(event, factor, True)
+        """加速 GIF: /加速 2"""
+        # 必须使用 async for 来迭代异步生成器
+        async for res in self._handle_speed(event, factor, True):
+            yield res
 
     @filter.command("减速")
     async def speed_down(self, event: AstrMessageEvent, factor: str = "2"):
-        await self._handle_speed(event, factor, False)
+        """减速 GIF: /减速 2"""
+        async for res in self._handle_speed(event, factor, False):
+            yield res
 
     async def _handle_speed(self, event: AstrMessageEvent, factor_str: str, is_up: bool):
+        """变速处理逻辑 (异步生成器)"""
         try:
             val = float(factor_str)
+            if val <= 0: raise ValueError
             factor = val if is_up else (1.0/val)
-        except: return
+        except: 
+            yield event.plain_result("❌ 请输入有效数字倍率")
+            return
 
         img_src = self._get_media_source(event, 'image')
-        # 如果是GIF图片
+        
+        # 场景1: GIF 图片
         if img_src and (img_src.endswith('.gif') or 'http' in img_src):
-            yield event.plain_result(f"⏳ GIF变速中...")
+            action = "加速" if is_up else "减速"
+            yield event.plain_result(f"⏳ GIF{action}中...")
             try:
                 data = b""
                 if img_src.startswith('http'):
                     async with aiohttp.ClientSession() as s:
-                        async with s.get(img_src) as r: data = await r.read()
+                        async with s.get(img_src, timeout=30) as r: data = await r.read()
                 elif os.path.exists(img_src):
                     with open(img_src, 'rb') as f: data = f.read()
                 
+                if not data:
+                    yield event.plain_result("❌ 图片下载失败")
+                    return
+
                 loop = asyncio.get_running_loop()
-                msg, out = await loop.run_in_executor(self.executor, self._process_gif_speed, data, factor)
-                if out: yield event.chain_result([Image.fromBytes(out.getvalue())])
-                else: yield event.plain_result(f"❌ {msg}")
-            except Exception as e: yield event.plain_result(f"❌ {e}")
+                msg, out = await loop.run_in_executor(
+                    self.executor, self._process_gif_speed, data, factor
+                )
+                
+                if out: 
+                    yield event.chain_result([Image.fromBytes(out.getvalue())])
+                else: 
+                    yield event.plain_result(f"❌ {msg}")
+            except Exception as e: 
+                yield event.plain_result(f"❌ 处理异常: {e}")
             return
             
-        yield event.plain_result("💡 若要对视频变速，请使用: /视频转gif 2x")
+        # 场景2: 视频 (引导使用转GIF指令)
+        video_src = self._get_media_source(event, 'video')
+        if video_src:
+            target_speed = f"{val}x" if is_up else f"{1/val:.2f}x"
+            yield event.plain_result(f"💡 检测到视频。请使用转GIF指令进行变速:\n/视频转gif speed={target_speed}")
+        else:
+            yield event.plain_result("❌ 未找到可处理的GIF或视频")
 
     # =======================================================
-    # 3. 网页截图与去广告 (Playwright实现)
+    # 3. 网页截图与去广告 (Playwright)
     # =======================================================
 
     async def _init_adblock_rules(self):
@@ -410,7 +442,6 @@ class Toolbox(Star):
 
     async def _setup_page(self, page, event: AstrMessageEvent):
         await page.set_viewport_size({"width": 1920, "height": 1080})
-        # 简单拦截
         if self.config.get("screenshot_config", {}).get("enable_adblock", True):
             async def route_handler(route):
                 req = route.request
@@ -424,14 +455,14 @@ class Toolbox(Star):
     async def web2img(self, event: AstrMessageEvent, url: str):
         """网页长截图: /web2img baidu.com"""
         if not url.startswith("http"): url = "https://" + url
-        yield event.plain_result("⏳ 正在截取长图...")
+        yield event.plain_result("⏳ 正在加载页面...")
         try:
             browser = await self._get_browser()
             page = await browser.new_page()
             try:
                 await self._setup_page(page, event)
                 await page.goto(url, wait_until="networkidle", timeout=60000)
-                # 自动滚动
+                # 自动滚动加载
                 await page.evaluate("async()=>{await new Promise(r=>{var t=0;var timer=setInterval(()=>{window.scrollBy(0,200);t+=200;if(t>=document.body.scrollHeight) {clearInterval(timer);r()}},50)})}")
                 
                 path = self.temp_dir / f"shot_{int(time.time())}.png"
@@ -451,6 +482,8 @@ class Toolbox(Star):
             try:
                 await self._setup_page(page, event)
                 await page.goto(url, wait_until="networkidle", timeout=90000)
+                await page.evaluate("async()=>{await new Promise(r=>{var t=0;var timer=setInterval(()=>{window.scrollBy(0,200);t+=200;if(t>=document.body.scrollHeight) {clearInterval(timer);r()}},50)})}")
+                
                 # 截图转PDF策略
                 img_path = self.temp_dir / f"tmp_{int(time.time())}.png"
                 pdf_path = self.temp_dir / f"web_{int(time.time())}.pdf"
@@ -465,9 +498,6 @@ class Toolbox(Star):
             finally: await page.close()
         except Exception as e: yield event.plain_result(f"❌ 失败: {e}")
 
-    # =======================================================
-    # 4. OCR 功能
-    # =======================================================
     @filter.command("ocr")
     async def ocr_cmd(self, event: AstrMessageEvent):
         """OCR识别: /ocr [图片]"""
