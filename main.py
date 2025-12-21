@@ -4,212 +4,148 @@ import shutil
 import asyncio
 import base64
 import time
-import subprocess
+import re
+import io
+import tempfile
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Set, Tuple
+from typing import Optional, List, Set, Tuple, Union
 
 # ================= 框架核心导入 =================
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, StarTools, register
-from astrbot.api.message_components import Image, Plain, File, Video, Reply
-from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from astrbot.api.message_components import Image, Plain, File, Video, Reply, Node, Nodes
 from astrbot.api import logger
 # ===============================================
 
 # ================= 第三方库导入 =================
 try:
     import aiohttp
-    # 注意：需安装 moviepy==1.0.3，新版 API 有变动
-    from moviepy.editor import VideoFileClip, vfx 
+    import imageio
     from pypdf import PdfWriter
-    from PIL import Image as PILImage
+    from PIL import Image as PILImage, ImageSequence
     from playwright.async_api import async_playwright, Playwright, Browser
 except ImportError as e:
-    logger.error(f"插件 astrbot_plugin_converter 依赖缺失: {e}")
-    logger.error("请确保 requirements.txt 内容为: moviepy==1.0.3 pypdf Pillow playwright aiohttp")
-    # 可以在这里选择不抛出异常，而是让功能失效，防止整个 Bot 崩溃
-    # raise e 
+    logger.error(f"插件依赖缺失: {e}")
+    logger.error("请确保安装: pip install imageio[ffmpeg] pypdf Pillow playwright aiohttp")
 
-@register("toolbox", "YourName", "多功能工具箱(截图/PDF/OCR/GIF加速)", "1.1.1")
+@register("toolbox", "YourName", "全能工具箱(截图/PDF/OCR/GIF)", "1.3.0")
 class Toolbox(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 数据目录
-        self.base_dir = StarTools.get_data_dir("astrbot_plugin_converter") 
+        # 目录配置
+        self.base_dir = StarTools.get_data_dir("astrbot_plugin_toolbox") 
         self.temp_dir = self.base_dir / "temp"
         self.rules_file = self.base_dir / "adblock_rules.txt"
-        
-        # 确保目录存在
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # 浏览器资源
+        # 资源管理
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self._browser_lock = asyncio.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # 线程池 (用于耗时操作)
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        
-        # 广告规则缓存
+        # 广告拦截
         self.ad_domains: Set[str] = set()
-        
-        # 异步初始化广告规则
         asyncio.create_task(self._init_adblock_rules())
 
     # =======================================================
-    # 广告拦截核心
+    # 1. 核心工具函数 (媒体提取/文件保存)
     # =======================================================
 
-    async def _init_adblock_rules(self):
-        if not self.config.get("screenshot_config", {}).get("enable_adblock", True):
-            return
-        if not self.rules_file.exists():
-            logger.info("Toolbox: 本地无规则库，准备初始化...")
-            await self._update_adblock_rules()
-        else:
-            await self._load_rules_to_memory()
-
-    async def _update_adblock_rules(self):
-        cfg = self.config.get("screenshot_config", {})
-        urls = cfg.get("adblock_list_urls", [])
-        if not urls:
-            urls = ["https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt"]
-        
-        proxy = cfg.get("proxy_url", "")
-        combined_content = ""
-        success_count = 0
-
-        logger.info(f"Toolbox: 开始更新 {len(urls)} 个广告规则源...")
-
-        async with aiohttp.ClientSession() as session:
-            for url in urls:
-                try:
-                    logger.info(f"Toolbox: 正在下载规则 -> {url}")
-                    async with session.get(url, proxy=proxy if proxy else None, timeout=20) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            combined_content += text + "\n"
-                            success_count += 1
-                        else:
-                            logger.warning(f"Toolbox: 规则源下载失败 [{resp.status}]: {url}")
-                except Exception as e:
-                    logger.warning(f"Toolbox: 规则源连接异常: {e} - {url}")
-
-        if success_count > 0:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(self.executor, self._write_rules_file, combined_content)
-                logger.info(f"Toolbox: 规则库更新完成，共合并 {success_count} 个源。")
-                await self._load_rules_to_memory()
-            except Exception as e:
-                logger.error(f"Toolbox: 规则文件写入失败: {e}")
-        else:
-            logger.error("Toolbox: 所有规则源均下载失败，请检查网络或代理设置。")
-
-    def _write_rules_file(self, content: str):
-        with open(self.rules_file, "w", encoding="utf-8") as f:
-            f.write(content)
-
-    async def _load_rules_to_memory(self):
-        if not self.rules_file.exists(): return
-        loop = asyncio.get_running_loop()
-        self.ad_domains = await loop.run_in_executor(self.executor, self._parse_rules_file)
-        logger.info(f"Toolbox: 内存已加载 {len(self.ad_domains)} 条广告屏蔽规则")
-
-    def _parse_rules_file(self) -> Set[str]:
-        temp_set = set()
+    def _save_animation(self, output: io.BytesIO, frames: list, duration_ms: int, loop: int = 0):
+        """统一保存动画，支持 GIF/APNG/WEBP"""
+        fmt = self.config.get('output_format', 'GIF').upper()
         try:
-            with open(self.rules_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or line.startswith("!"): continue
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        temp_set.add(parts[1])
-                    elif len(parts) == 1 and "." in line:
-                        temp_set.add(line)
+            if fmt == 'APNG':
+                frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], 
+                             duration=duration_ms, loop=loop, optimize=True, default_image=True)
+            elif fmt == 'WEBP':
+                frames[0].save(output, format='WEBP', save_all=True, append_images=frames[1:], 
+                             duration=duration_ms, loop=loop, method=3, quality=80)
+            else:
+                # GIF 默认配置
+                frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
+                             duration=duration_ms, loop=loop, optimize=True, disposal=2)
         except Exception as e:
-            logger.error(f"Toolbox: 规则解析异常: {e}")
-        return temp_set
+            logger.error(f"Save animation failed, fallback to GIF. Error: {e}")
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
+                         duration=duration_ms, loop=loop, optimize=True, disposal=2)
 
-    async def _setup_page(self, page, event: AstrMessageEvent):
-        cfg = self.config.get("screenshot_config", {})
-        await page.set_viewport_size({"width": cfg.get("width", 1920), "height": cfg.get("height", 1080)})
-
-        if cfg.get("enable_adblock", True):
-            # 注入 CSS 隐藏常见广告元素
-            await page.add_style_tag(content="""
-                div[class*="ad-"], div[id*="ad-"], div[class*="banner"], 
-                iframe[src*="ads"], iframe[src*="google"], .adsbygoogle, .g-ads, 
-                #google_ads_frame, [id^="google_ads_"], [id^="div-gpt-ad"] {
-                    display: none !important; height: 0 !important; width: 0 !important; visibility: hidden !important;
-                }
-            """)
+    async def _resolve_file_via_api(self, event: AstrMessageEvent, file_id: str) -> str:
+        """调用 Bot API 解析 file_id"""
+        try:
+            res = await event.bot.api.call_action("get_file", file_id=file_id)
+            if not res or not isinstance(res, dict): return None
             
-            block_types = {"image", "media", "font", "script", "xhr", "fetch", "websocket", "other"}
-            custom_keywords = cfg.get("custom_block_list", [])
+            url = res.get('url')
+            if url and url.startswith('http'): return url
+            path = res.get('file')
+            if path and os.path.exists(path): return path
+            return url or path
+        except: return None
 
-            async def route_handler(route):
-                req = route.request
-                # 仅拦截非主文档请求
-                if req.resource_type in block_types:
-                    try:
-                        hostname = urlparse(req.url).hostname
-                        if hostname and hostname in self.ad_domains: return await route.abort()
-                        url_str = req.url.lower()
-                        for kw in custom_keywords:
-                            if kw.replace('*', '') in url_str: return await route.abort()
-                    except: pass
-                await route.continue_()
+    def _get_media_source(self, event: AstrMessageEvent, media_type: str = 'video') -> Optional[str]:
+        """强大的媒体提取器，支持引用回复、原始数据包解析"""
+        candidates = [] # (score, url/path)
+        
+        def extract(item):
+            # 1. URL
+            url = getattr(item, 'url', None)
+            if not url and isinstance(item, dict):
+                url = item.get('data', {}).get('url') or item.get('url')
+            if url and isinstance(url, str) and url.startswith('http'):
+                return 100, url
+            # 2. Path
+            path = getattr(item, 'path', None)
+            if not path and isinstance(item, dict):
+                path = item.get('data', {}).get('path') or item.get('path')
+            if path and isinstance(path, str) and os.path.isabs(path) and os.path.exists(path):
+                return 90, path
+            # 3. File ID
+            fid = getattr(item, 'file', None)
+            if not fid and isinstance(item, dict):
+                fid = item.get('data', {}).get('file') or item.get('file')
+            if fid and isinstance(fid, str):
+                return 50, fid
+            return 0, None
+
+        items = []
+        # 检查 AstrBot 封装的方法
+        if media_type == 'video' and hasattr(event, "get_videos"): items.extend(event.get_videos() or [])
+        if media_type == 'image' and hasattr(event, "get_images"): items.extend(event.get_images() or [])
+        
+        # 检查原始数据 (OneBot 协议)
+        raw = getattr(event, 'raw_message', None) or getattr(event, 'raw_data', {})
+        if isinstance(raw, dict) and 'reply' in raw:
+            reply_pl = raw['reply']
+            msgs = reply_pl.get('message') or reply_pl.get('content')
+            if isinstance(msgs, list): items.extend(msgs)
+
+        # 检查当前消息链
+        if hasattr(event.message_obj, "message"):
+            for seg in event.message_obj.message:
+                if isinstance(seg, (Image, Video, dict)):
+                    # 简单类型过滤
+                    if isinstance(seg, dict):
+                        if seg.get('type') == media_type: items.append(seg)
+                    elif (media_type == 'image' and isinstance(seg, Image)) or \
+                         (media_type == 'video' and isinstance(seg, Video)):
+                        items.append(seg)
+
+        for item in items:
+            s, v = extract(item)
+            if v: candidates.append((s, v))
             
-            await page.route("**/*", route_handler)
-
-    # =======================================================
-    # 资源管理 (Browser)
-    # =======================================================
-    
-    async def _get_browser(self) -> Browser:
-        async with self._browser_lock:
-            if self.browser and self.browser.is_connected(): return self.browser
-            if not self.playwright: self.playwright = await async_playwright().start()
-            
-            shot_cfg = self.config.get("screenshot_config", {})
-            proxy_url = shot_cfg.get("proxy_url", "")
-            
-            # 使用 Firefox，兼容性较好且容易去指纹
-            launch_args = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
-            if proxy_url:
-                logger.info(f"Toolbox: 使用代理启动浏览器 -> {proxy_url}")
-                launch_args["proxy"] = {"server": proxy_url}
-
-            self.browser = await self.playwright.firefox.launch(**launch_args)
-            return self.browser
-
-    def _install_firefox_sync(self):
-        logger.info("Toolbox: 正在安装 Firefox...")
-        cmd = [sys.executable, "-m", "playwright", "install", "firefox"]
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        logger.info("Toolbox: Firefox 安装成功")
-
-    async def _ensure_browser_env(self, event: AstrMessageEvent) -> Browser:
-        try: 
-            return await self._get_browser()
-        except Exception as e:
-            if "executable" in str(e).lower() or "not found" in str(e).lower():
-                logger.warning("Toolbox: Firefox内核缺失，触发自动安装")
-                if event: await event.send(MessageChain([Plain("正在初始化 Firefox 内核，请稍候...")]))
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(self.executor, self._install_firefox_sync)
-                return await self._get_browser()
-            else: 
-                raise e
+        if not candidates: return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
 
     async def terminate(self):
-        """插件卸载/重载时清理资源"""
-        logger.info("Toolbox: 正在清理资源...")
+        """资源清理"""
+        logger.info("Toolbox: 清理资源...")
         if self.browser:
             try: await self.browser.close()
             except: pass
@@ -217,445 +153,357 @@ class Toolbox(Star):
             try: await self.playwright.stop()
             except: pass
         self.executor.shutdown(wait=False)
-        if self.temp_dir.exists(): 
-            try: shutil.rmtree(self.temp_dir, ignore_errors=True)
-            except: pass
+        try: shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except: pass
 
     # =======================================================
-    # 核心功能实现
+    # 2. 视频转GIF / 变速 / 压缩 (ImageIO实现)
     # =======================================================
 
-    async def _auto_scroll(self, page):
-        """自动滚动页面以触发懒加载"""
-        if not self.config.get("screenshot_config", {}).get("enable_auto_scroll", True): return
-        await page.evaluate("""
-            async () => {
-                await new Promise((resolve, reject) => {
-                    var totalHeight = 0; var distance = 200;
-                    var timer = setInterval(() => {
-                        var scrollHeight = document.body.scrollHeight;
-                        window.scrollBy(0, distance); totalHeight += distance;
-                        if(totalHeight >= scrollHeight || totalHeight > 50000){ clearInterval(timer); resolve(); }
-                    }, 80);
-                });
-            }
-        """)
-        await page.wait_for_timeout(800)
+    def _parse_video_args(self, text: str):
+        """参数解析: 0s-5s, fps=15, 0.5x, scale=0.8"""
+        params = {
+            'start': 0.0, 'end': None,
+            'fps': self.config.get('default_fps', 12),
+            'scale': self.config.get('default_scale', 0.5), 
+            'speed': 1.0 
+        }
+        # 时间
+        time_range = re.search(r'(\d+(?:\.\d+)?)[sS]?\s*[-~]\s*(\d+(?:\.\d+)?)[sS]?', text)
+        if time_range:
+            params['start'] = float(time_range.group(1))
+            params['end'] = float(time_range.group(2))
+        # 帧率
+        fps_match = re.search(r'(?:fps|帧率)[ :=]?(\d+)', text, re.IGNORECASE)
+        if fps_match: params['fps'] = int(fps_match.group(1))
+        # 缩放
+        scale_match = re.search(r'(?:scale|缩放|大小)[ :=]?(0\.\d+|1\.0)', text)
+        if scale_match: params['scale'] = float(scale_match.group(1))
+        # 速度
+        speed_match = re.search(r'(\d+(?:\.\d+)?)[xX]?(?:倍速|倍|speed)', text)
+        if speed_match: params['speed'] = float(speed_match.group(1))
+        return params
 
-    async def _core_screenshot(self, event: AstrMessageEvent, url: str) -> str:
-        if not url.startswith("http"): url = "https://" + url
-        browser = await self._ensure_browser_env(event)
-        # 创建新页面 (上下文独立)
-        page = await browser.new_page()
+    def _process_video_core(self, video_path: str, params: dict, max_colors: int = 256):
+        """转换核心逻辑"""
         try:
-            await self._setup_page(page, event)
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await self._auto_scroll(page)
+            reader = imageio.get_reader(video_path, format='FFMPEG')
+            meta = reader.get_meta_data()
+            src_fps = meta.get('fps', 30) or 30
+            duration = meta.get('duration', 100)
+
+            start_t = params['start']
+            end_t = params['end'] if params['end'] else duration
             
-            path = self.temp_dir / f"shot_{int(time.time())}.png"
-            await page.screenshot(path=str(path), full_page=True)
-            return str(path)
-        finally: 
-            await page.close()
+            # 限制时长防止内存溢出
+            max_dur = self.config.get('max_gif_duration', 15.0)
+            if (end_t - start_t) > max_dur: end_t = start_t + max_dur
 
-    async def _core_web_to_pdf(self, event: AstrMessageEvent, urls: str) -> str:
-        url_list = [u.strip() for u in urls.replace(',', ' ').split(' ') if u.strip()]
-        if not url_list: raise ValueError("无有效URL")
-        
-        browser = await self._ensure_browser_env(event)
-        temp_pdfs = []
-        
-        try:
-            for idx, raw_url in enumerate(url_list):
-                url = raw_url if raw_url.startswith("http") else "https://" + raw_url
-                page = await browser.new_page()
-                try:
-                    await self._setup_page(page, event)
-                    await page.goto(url, wait_until="networkidle", timeout=90000)
-                    await self._auto_scroll(page)
-                    
-                    # 策略: 先截图再转PDF (保证所见即所得，避免打印样式丢失)
-                    img_path = self.temp_dir / f"tmp_{idx}.png"
-                    await page.screenshot(path=str(img_path), full_page=True)
-                    
-                    # 转换图片为PDF
-                    img = PILImage.open(str(img_path))
-                    if img.mode == 'RGBA': img = img.convert('RGB')
-                    pdf_path = self.temp_dir / f"tmp_{idx}.pdf"
-                    img.save(str(pdf_path), "PDF", resolution=100.0)
-                    temp_pdfs.append(pdf_path)
-                    
-                    # 清理中间图片
-                    try: os.remove(img_path)
-                    except: pass
-                    
-                except Exception as e: 
-                    logger.error(f"Page failed: {url} - {e}")
-                finally: 
-                    await page.close()
-
-            if not temp_pdfs: raise Exception("所有网页处理失败")
+            # 计算采样步长
+            target_fps = params['fps']
+            base_step = max(1, src_fps / target_fps)
+            final_step = max(1, int(base_step * params['speed']))
             
-            final_path = self.temp_dir / f"WebCollection_{int(time.time())}.pdf"
-            merger = PdfWriter()
-            for pdf in temp_pdfs: merger.append(str(pdf))
-            merger.write(str(final_path))
-            merger.close()
-            
-            # 清理中间PDF
-            for pdf in temp_pdfs:
-                try: os.remove(pdf)
-                except: pass
-            return str(final_path)
-        except Exception: 
-            raise
+            frames = []
+            output_fmt = self.config.get('output_format', 'GIF').upper()
 
-    # =======================================================
-    # 媒体提取与GIF/视频加速逻辑
-    # =======================================================
-
-    def _extract_media_from_data(self, data: list | dict) -> Tuple[Optional[str], bool]:
-        """
-        从 OneBot 的 message 结构中提取图片/视频 URL
-        返回: (url, is_video)
-        """
-        if isinstance(data, list):
-            for seg in data:
-                if not isinstance(seg, dict): continue
-                seg_type = seg.get('type')
-                seg_data = seg.get('data', {})
+            for i, frame in enumerate(reader):
+                curr_t = i / src_fps
+                if curr_t < start_t: continue
+                if curr_t > end_t: break
                 
-                # 提取逻辑: 优先 url, 其次 file(若是http)
-                url = seg_data.get('url')
-                if not url:
-                    file_val = seg_data.get('file', '')
-                    if file_val and str(file_val).startswith('http'):
-                        url = file_val
+                if i % final_step == 0:
+                    pil_img = PILImage.fromarray(frame)
+                    # 缩放
+                    if params['scale'] != 1.0:
+                        w, h = pil_img.size
+                        pil_img = pil_img.resize((int(w*params['scale']), int(h*params['scale'])), PILImage.Resampling.BILINEAR)
+                    # 量化
+                    if output_fmt == 'GIF' and max_colors < 256:
+                        pil_img = pil_img.quantize(colors=max_colors, method=1)
+                    frames.append(pil_img)
                 
-                if url:
-                    if seg_type == 'video': return url, True
-                    if seg_type == 'image': return url, False
-        return None, False
+                if len(frames) > 500: break # 安全熔断
 
-    async def _process_speed(self, event: AstrMessageEvent, speed_factor: float, fps: int = 15):
-        media_url = None
-        is_video = False
-        
-        # 1. 优先检查当前消息链 (例如: /加速 [图片])
-        for comp in event.message_obj.message:
-            if isinstance(comp, Image) and comp.url:
-                media_url = comp.url
-                break
-            elif isinstance(comp, Video) and comp.url:
-                media_url = comp.url; is_video = True
-                break
-        
-        # 2. 如果没找到，检查引用回复
-        if not media_url:
-            # 修复：使用 event.raw_message 获取原始字典，而非 message_obj.raw_message (通常是字符串)
-            # 兼容不同版本的 AstrBot 事件结构
-            raw = getattr(event, 'raw_message', None) or getattr(event, 'raw_data', {})
+            reader.close()
+            if not frames: return None, "无有效帧", 0
             
-            if isinstance(raw, dict) and 'reply' in raw:
-                reply_payload = raw['reply']
-                # 兼容不同适配器字段
-                possible_msgs = reply_payload.get('message') or reply_payload.get('content')
-                if possible_msgs:
-                    media_url, is_video = self._extract_media_from_data(possible_msgs)
-
-        if not media_url:
-            await event.send(MessageChain([Plain("未找到图片或视频。请直接发送图片，或回复一张图片/视频并输入指令。")]))
-            return
-
-        await event.send(MessageChain([Plain(f"正在处理 (倍率 {speed_factor:.1f}x)...")]))
-
-        local_path = None
-        out_path = None
-
-        try:
-            # 下载文件
-            suffix = ".mp4" if is_video else ".gif"
-            local_path = self.temp_dir / f"src_{int(time.time())}{suffix}"
-            
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(media_url) as resp:
-                    if resp.status != 200:
-                        await event.send(MessageChain([Plain("媒体文件下载失败。")]))
-                        return
-                    content = await resp.read()
-                    with open(local_path, 'wb') as f: f.write(content)
-
-            out_path = self.temp_dir / f"out_{int(time.time())}.gif"
-            
-            # 在线程池中进行耗时转换
-            def _convert_task():
-                clip = None
-                new_clip = None
-                try:
-                    clip = VideoFileClip(str(local_path))
-                    # MoviePy 1.x 语法
-                    new_clip = clip.fx(vfx.speedx, speed_factor)
-                    new_clip.write_gif(str(out_path), fps=fps, verbose=False, logger=None)
-                except Exception as e:
-                    logger.error(f"MoviePy Convert Error: {e}")
-                    raise e
-                finally:
-                    # 修复: 必须显式关闭资源，否则Windows下无法删除文件
-                    if new_clip: 
-                        try: new_clip.close()
-                        except: pass
-                    if clip: 
-                        try: clip.close()
-                        except: pass
-
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, _convert_task)
-
-            if out_path.exists():
-                await event.send(MessageChain([Image.fromFileSystem(str(out_path))]))
-            else:
-                await event.send(MessageChain([Plain("处理失败: 输出文件未生成")]))
-
+            output = io.BytesIO()
+            duration_ms = int(1000 / (src_fps / final_step))
+            self._save_animation(output, frames, duration_ms)
+            output.seek(0)
+            size_mb = output.getbuffer().nbytes / 1024 / 1024
+            return output, f"FPS:{src_fps/final_step:.1f} 时间:{start_t}-{end_t:.1f}s", size_mb
         except Exception as e:
-            logger.error(f"Speed Error: {e}")
-            await event.send(MessageChain([Plain(f"处理异常: {e}")]))
+            return None, str(e), 0
+
+    def _worker_video_wrapper(self, video_path: str, params: dict):
+        """工作线程：包含智能压缩重试逻辑"""
+        max_colors = self.config.get('gif_max_colors', 256)
+        
+        # 第一次尝试
+        gif_io, msg, size_mb = self._process_video_core(video_path, params, max_colors)
+        if not gif_io: return msg, None
+        
+        # 智能压缩: 如果是 GIF 且 > 10MB
+        if size_mb > 10.0 and self.config.get('output_format', 'GIF').upper() == 'GIF':
+            new_params = params.copy()
+            new_params['scale'] = round(params['scale'] * 0.7, 2)
+            if new_params['scale'] < 0.1: new_params['scale'] = 0.1
+            
+            retry_io, retry_msg, retry_size = self._process_video_core(video_path, new_params, 128)
+            if retry_io and retry_size < size_mb:
+                return f"⚠️ 原始{size_mb:.1f}MB过大，已自动压缩 -> {retry_msg}", retry_io
+                
+        return f"✅ 转换成功 {msg} ({size_mb:.2f}MB)", gif_io
+
+    def _process_gif_speed(self, img_data: bytes, factor: float):
+        """GIF变速处理"""
+        try:
+            img = PILImage.open(io.BytesIO(img_data))
+            if not getattr(img, "is_animated", False): return "这不是动图", None
+            
+            frames, durs = [], []
+            for frame in ImageSequence.Iterator(img):
+                new_dur = max(20, int(frame.info.get('duration', 100) / factor))
+                durs.append(new_dur)
+                frames.append(frame.copy())
+            
+            output = io.BytesIO()
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
+                         duration=durs, loop=0, disposal=2, optimize=True)
+            output.seek(0)
+            return "✅ 变速完成", output
+        except Exception as e: return f"异常: {e}", None
+
+    @filter.command("视频转gif")
+    async def video_to_gif_cmd(self, event: AstrMessageEvent):
+        """视频转GIF: /视频转gif 0s-5s fps=15"""
+        params = self._parse_video_args(event.message_str.replace("视频转gif", ""))
+        
+        # 1. 获取源
+        raw_src = self._get_media_source(event, 'video')
+        if not raw_src:
+            yield event.plain_result("❌ 请回复视频或发送链接")
+            return
+            
+        # 2. 解析
+        valid_src = raw_src
+        if not (raw_src.startswith("http") or os.path.exists(raw_src)):
+            yield event.plain_result("⏳ 解析视频地址...")
+            valid_src = await self._resolve_file_via_api(event, raw_src)
+            if not valid_src:
+                yield event.plain_result("❌ 无法获取视频")
+                return
+
+        yield event.plain_result(f"⏳ 处理中... (缩放:{params['scale']} FPS:{params['fps']})")
+
+        # 3. 下载与处理
+        tmp_path = ""
+        is_temp = False
+        try:
+            if valid_src.startswith("http"):
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                    tmp_path = tf.name
+                    is_temp = True
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(valid_src, timeout=60) as resp:
+                        if resp.status != 200:
+                            yield event.plain_result("❌ 下载失败")
+                            return
+                        with open(tmp_path, 'wb') as f: f.write(await resp.read())
+            else:
+                tmp_path = valid_src
+            
+            loop = asyncio.get_running_loop()
+            msg, gif_bytes = await loop.run_in_executor(self.executor, self._worker_video_wrapper, tmp_path, params)
+            
+            if gif_bytes:
+                yield event.chain_result([Plain(msg), Image.fromBytes(gif_bytes.getvalue())])
+            else:
+                yield event.plain_result(f"❌ 失败: {msg}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 错误: {e}")
         finally:
-            # 清理临时文件
-            if local_path and local_path.exists():
-                try: os.remove(local_path)
+            if is_temp and os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
                 except: pass
-            if out_path and out_path.exists():
-                try: os.remove(out_path)
-                except: pass
-
-    # =======================================================
-    # 指令区
-    # =======================================================
-
-    @filter.command("updatedb")
-    async def update_db_cmd(self, event: AstrMessageEvent):
-        """更新广告拦截规则库"""
-        yield event.plain_result("正在下载最新广告规则...")
-        await self._update_adblock_rules()
-        yield event.plain_result(f"更新完成，规则数: {len(self.ad_domains)}")
 
     @filter.command("加速")
-    async def speed_up_cmd(self, event: AstrMessageEvent, factor: str = "2", fps: str = "15"):
-        """加速 GIF/视频: /加速 2"""
-        try:
-            f = float(factor)
-            target_fps = int(fps)
-            if f <= 1: 
-                yield event.plain_result("倍数需大于1")
-                return
-            await self._process_speed(event, f, target_fps)
-        except ValueError:
-            yield event.plain_result("参数错误，请输入数字")
+    async def speed_up(self, event: AstrMessageEvent, factor: str = "2"):
+        await self._handle_speed(event, factor, True)
 
     @filter.command("减速")
-    async def speed_down_cmd(self, event: AstrMessageEvent, factor: str = "2", fps: str = "15"):
-        """减速 GIF/视频: /减速 2"""
+    async def speed_down(self, event: AstrMessageEvent, factor: str = "2"):
+        await self._handle_speed(event, factor, False)
+
+    async def _handle_speed(self, event: AstrMessageEvent, factor_str: str, is_up: bool):
         try:
-            f = float(factor)
-            target_fps = int(fps)
-            if f <= 0:
-                yield event.plain_result("倍数需大于0")
-                return
-            await self._process_speed(event, 1.0/f, target_fps)
-        except ValueError:
-            yield event.plain_result("参数错误，请输入数字")
+            val = float(factor_str)
+            factor = val if is_up else (1.0/val)
+        except: return
+
+        img_src = self._get_media_source(event, 'image')
+        # 如果是GIF图片
+        if img_src and (img_src.endswith('.gif') or 'http' in img_src):
+            yield event.plain_result(f"⏳ GIF变速中...")
+            try:
+                data = b""
+                if img_src.startswith('http'):
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(img_src) as r: data = await r.read()
+                elif os.path.exists(img_src):
+                    with open(img_src, 'rb') as f: data = f.read()
+                
+                loop = asyncio.get_running_loop()
+                msg, out = await loop.run_in_executor(self.executor, self._process_gif_speed, data, factor)
+                if out: yield event.chain_result([Image.fromBytes(out.getvalue())])
+                else: yield event.plain_result(f"❌ {msg}")
+            except Exception as e: yield event.plain_result(f"❌ {e}")
+            return
+            
+        yield event.plain_result("💡 若要对视频变速，请使用: /视频转gif 2x")
+
+    # =======================================================
+    # 3. 网页截图与去广告 (Playwright实现)
+    # =======================================================
+
+    async def _init_adblock_rules(self):
+        if not self.config.get("screenshot_config", {}).get("enable_adblock", True): return
+        if not self.rules_file.exists(): await self._update_adblock_rules()
+        else: await self._load_rules_to_memory()
+
+    async def _update_adblock_rules(self):
+        urls = ["https://raw.githubusercontent.com/AdAway/adaway.github.io/master/hosts.txt"]
+        content = ""
+        async with aiohttp.ClientSession() as sess:
+            for url in urls:
+                try:
+                    async with sess.get(url, timeout=10) as r:
+                        if r.status==200: content += await r.text() + "\n"
+                except: pass
+        if content:
+            with open(self.rules_file, "w", encoding="utf-8") as f: f.write(content)
+            await self._load_rules_to_memory()
+
+    async def _load_rules_to_memory(self):
+        def parse():
+            s = set()
+            try:
+                with open(self.rules_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith(('#','!')):
+                            parts = line.split()
+                            if len(parts)>=2: s.add(parts[1])
+            except: pass
+            return s
+        loop = asyncio.get_running_loop()
+        self.ad_domains = await loop.run_in_executor(self.executor, parse)
+
+    async def _get_browser(self):
+        async with self._browser_lock:
+            if self.browser and self.browser.is_connected(): return self.browser
+            if not self.playwright: self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.firefox.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            return self.browser
+
+    async def _setup_page(self, page, event: AstrMessageEvent):
+        await page.set_viewport_size({"width": 1920, "height": 1080})
+        # 简单拦截
+        if self.config.get("screenshot_config", {}).get("enable_adblock", True):
+            async def route_handler(route):
+                req = route.request
+                if req.resource_type in {"image", "media", "script", "xhr"}:
+                    hn = urlparse(req.url).hostname
+                    if hn and hn in self.ad_domains: return await route.abort()
+                await route.continue_()
+            await page.route("**/*", route_handler)
 
     @filter.command("web2img")
-    async def web_screenshot_cmd(self, event: AstrMessageEvent, url: str):
-        """网页长截图: /web2img https://baidu.com"""
+    async def web2img(self, event: AstrMessageEvent, url: str):
+        """网页长截图: /web2img baidu.com"""
+        if not url.startswith("http"): url = "https://" + url
+        yield event.plain_result("⏳ 正在截取长图...")
         try:
-            yield event.plain_result("正在加载页面...")
-            path = await self._core_screenshot(event, url)
-            yield event.image_result(str(path))
-        except Exception as e:
-            yield event.plain_result(f"截图失败: {e}")
+            browser = await self._get_browser()
+            page = await browser.new_page()
+            try:
+                await self._setup_page(page, event)
+                await page.goto(url, wait_until="networkidle", timeout=60000)
+                # 自动滚动
+                await page.evaluate("async()=>{await new Promise(r=>{var t=0;var timer=setInterval(()=>{window.scrollBy(0,200);t+=200;if(t>=document.body.scrollHeight) {clearInterval(timer);r()}},50)})}")
+                
+                path = self.temp_dir / f"shot_{int(time.time())}.png"
+                await page.screenshot(path=str(path), full_page=True)
+                yield event.image_result(str(path))
+            finally: await page.close()
+        except Exception as e: yield event.plain_result(f"❌ 截图失败: {e}")
 
     @filter.command("web2pdf")
-    async def web_to_pdf_cmd(self, event: AstrMessageEvent, urls: str):
-        """网页转PDF: /web2pdf url1 url2"""
-        yield event.plain_result("正在处理，耗时较长请稍候...")
+    async def web2pdf(self, event: AstrMessageEvent, url: str):
+        """网页转PDF: /web2pdf url"""
+        if not url.startswith("http"): url = "https://" + url
+        yield event.plain_result("⏳ 正在转换PDF...")
         try:
-            path = await self._core_web_to_pdf(event, urls)
-            yield event.chain_result([File(file=str(path), name="网页合集.pdf")])
-        except Exception as e:
-            yield event.plain_result(f"处理失败: {e}")
+            browser = await self._get_browser()
+            page = await browser.new_page()
+            try:
+                await self._setup_page(page, event)
+                await page.goto(url, wait_until="networkidle", timeout=90000)
+                # 截图转PDF策略
+                img_path = self.temp_dir / f"tmp_{int(time.time())}.png"
+                pdf_path = self.temp_dir / f"web_{int(time.time())}.pdf"
+                
+                await page.screenshot(path=str(img_path), full_page=True)
+                
+                img = PILImage.open(str(img_path)).convert('RGB')
+                img.save(str(pdf_path), "PDF", resolution=100.0)
+                
+                yield event.chain_result([File(file=str(pdf_path), name="WebPage.pdf")])
+                os.remove(img_path)
+            finally: await page.close()
+        except Exception as e: yield event.plain_result(f"❌ 失败: {e}")
 
+    # =======================================================
+    # 4. OCR 功能
+    # =======================================================
     @filter.command("ocr")
     async def ocr_cmd(self, event: AstrMessageEvent):
-        """OCR文字识别 (附带图片)"""
-        img_url = None
-        for comp in event.message_obj.message:
-            if isinstance(comp, Image):
-                img_url = comp.url
-                break
-        
-        if not img_url:
-            yield event.plain_result("请附带图片")
+        """OCR识别: /ocr [图片]"""
+        img_src = self._get_media_source(event, 'image')
+        if not img_src:
+            yield event.plain_result("❌ 请附带图片")
             return
-
+            
         cfg = self.config.get("ocr_config", {})
-        api_key = cfg.get("api_key")
-        if not api_key:
-            yield event.plain_result("未配置 OCR API Key (config.json)")
+        key = cfg.get("api_key")
+        if not key:
+            yield event.plain_result("未配置 OCR API Key")
             return
 
         try:
-            async with aiohttp.ClientSession() as session:
-                # 1. 下载图片
-                async with session.get(img_url) as img_resp:
-                    if img_resp.status != 200:
-                        yield event.plain_result(f"图片下载失败: {img_resp.status}")
-                        return
-                    img_bytes = await img_resp.read()
-                    base64_image = base64.b64encode(img_bytes).decode('utf-8')
-
-                # 2. 构建请求
-                # 智能判断 URL 是否包含后缀
-                api_base = cfg.get("api_url", "https://api.openai.com/v1").rstrip('/')
-                if "chat/completions" not in api_base:
-                    api_url = f"{api_base}/chat/completions"
-                else:
-                    api_url = api_base
-
-                payload = {
-                    "model": cfg.get("model_name", "gpt-4o"),
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": "OCR task: Extract all text from this image directly without formatting. Do not explain."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]}],
-                    "max_tokens": 2000
-                }
-                headers = {
-                    "Authorization": f"Bearer {api_key}", 
-                    "Content-Type": "application/json"
-                }
-                
-                # 3. 发送请求
-                async with session.post(api_url, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        yield event.plain_result(f"API错误 {resp.status}: {err_text[:100]}")
-                        return
-                    data = await resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    yield event.plain_result(content)
-
-        except Exception as e:
-            logger.error(f"OCR Error: {e}")
-            yield event.plain_result(f"OCR执行出错: {e}")
-
-    @filter.command("mergepdf")
-    async def merge_pdf_cmd(self, event: AstrMessageEvent):
-        """合并多个PDF文件"""
-        yield event.plain_result("请发送PDF文件，发送 'end' 或 '结束' 完成合并。")
-        pdf_files = []
-        
-        # 300秒超时
-        @session_waiter(timeout=300)
-        async def waiter(controller: SessionController, ctx: AstrMessageEvent):
-            text = ctx.message_str.strip().lower()
-            if text in ["end", "结束", "ok", "完成"]:
-                if not pdf_files:
-                    await ctx.send(ctx.plain_result("未收到任何文件，会话结束。"))
-                else:
-                    out = self.temp_dir / f"Merged_{int(time.time())}.pdf"
-                    try:
-                        merger = PdfWriter()
-                        for f in pdf_files: merger.append(str(f))
-                        merger.write(str(out))
-                        merger.close()
-                        await ctx.send(ctx.chain_result([File(file=str(out), name="合并结果.pdf")]))
-                    except Exception as e:
-                        await ctx.send(ctx.plain_result(f"合并失败: {e}"))
-                    finally:
-                        # 清理上传的临时文件
-                        for f in pdf_files:
-                            try: os.remove(f)
-                            except: pass
-                controller.stop()
-                return
+            img_data = b""
+            if img_src.startswith("http"):
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(img_src) as r: img_data = await r.read()
+            elif os.path.exists(img_src):
+                with open(img_src, "rb") as f: img_data = f.read()
             
-            # 检查文件上传
-            file_url = None
-            for comp in ctx.message_obj.message:
-                if isinstance(comp, File) and comp.url:
-                    file_url = comp.url
-                    break
+            b64_img = base64.b64encode(img_data).decode('utf-8')
             
-            if file_url:
-                local = self.temp_dir / f"upload_{len(pdf_files)}_{int(time.time())}.pdf"
-                try:
-                    if file_url.startswith("http"):
-                        async with aiohttp.ClientSession() as sess:
-                            async with sess.get(file_url) as resp:
-                                with open(local, 'wb') as f: f.write(await resp.read())
-                    else:
-                        shutil.copy(file_url, local)
-                    
-                    pdf_files.append(local)
-                    await ctx.send(ctx.plain_result(f"已接收第 {len(pdf_files)} 个文件 (输入 '结束' 以合并)"))
-                except Exception as e:
-                    await ctx.send(ctx.plain_result(f"文件接收失败: {e}"))
-            
-            controller.keep() 
-        
-        # 启动会话等待
-        await waiter(event)
-
-    # =======================================================
-    # LLM Tools (供大模型调用)
-    # =======================================================
-
-    @filter.llm_tool(name="web_screenshot")
-    async def web_screenshot_tool(self, event: AstrMessageEvent, url: str):
-        """截图网页"""
-        try:
-            path = await self._core_screenshot(event, url)
-            await event.send(MessageChain([Image.fromFileSystem(str(path))]))
-            return "截图已发送"
-        except Exception as e: return f"失败: {e}"
-
-    @filter.llm_tool(name="multi_web_to_pdf")
-    async def multi_web_to_pdf_tool(self, event: AstrMessageEvent, urls: str):
-        """将多个网页转为PDF"""
-        try:
-            await event.send(MessageChain([Plain("正在处理(Firefox)...")]))
-            path = await self._core_web_to_pdf(event, urls)
-            await event.send(MessageChain([File(file=str(path), name="网页合集.pdf")]))
-            return "PDF已发送"
-        except Exception as e: return f"失败: {e}"
-
-    @filter.llm_tool(name="convert_image")
-    async def convert_image_tool(self, event: AstrMessageEvent, target_format: str):
-        """转换图片格式 (jpg/png/webp)"""
-        target = target_format.lower().replace('.', '')
-        if target not in ['jpg', 'jpeg', 'png', 'webp', 'bmp']: return "不支持该格式"
-        
-        img_url = None
-        for comp in event.message_obj.message:
-            if isinstance(comp, Image):
-                img_url = comp.url
-                break
-        if not img_url: return "请在对话中发送一张图片"
-        
-        try:
-            local = self.temp_dir / f"src_{int(time.time())}"
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(img_url) as resp:
-                    with open(local, 'wb') as f: f.write(await resp.read())
-            
-            img = PILImage.open(str(local))
-            if target in ['jpg', 'jpeg'] and img.mode in ('RGBA', 'P'): 
-                img = img.convert('RGB')
-                
-            out = self.temp_dir / f"cvt_{int(time.time())}.{target}"
-            img.save(str(out))
-            
-            await event.send(MessageChain([Image.fromFileSystem(str(out))]))
-            return "转换成功"
-        except Exception as e: return f"错误: {e}"
+            api_url = cfg.get("api_url", "https://api.openai.com/v1/chat/completions")
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            payload = {
+                "model": cfg.get("model_name", "gpt-4o"),
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "OCR this image. Output text only."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]}]
+            }
+            async with aiohttp.ClientSession() as s:
+                async with s.post(api_url, headers=headers, json=payload) as r:
+                    res = await r.json()
+                    txt = res["choices"][0]["message"]["content"]
+                    yield event.plain_result(txt)
+        except Exception as e: yield event.plain_result(f"OCR Error: {e}")
