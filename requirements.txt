@@ -1,5 +1,5 @@
-moviepy==1.0.3
+aiohttp
+playwright
 pypdf
 Pillow
-playwright
-aiohttp
+imageio[ffmpeg]
